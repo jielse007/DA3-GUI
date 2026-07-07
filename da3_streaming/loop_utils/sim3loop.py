@@ -14,10 +14,18 @@
 #
 # Adapted from [VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long)
 
+from __future__ import annotations
+
 import time
 from typing import List, Tuple
 import numpy as np
-import pypose as pp
+
+try:
+    import pypose as pp
+    _HAS_PYPOSE = True
+except ImportError:
+    _HAS_PYPOSE = False
+    pp = None
 import torch
 from fastloop.solve_python import solve_system_py
 from scipy.spatial.transform import Rotation as R

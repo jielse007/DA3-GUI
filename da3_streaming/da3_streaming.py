@@ -26,6 +26,12 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+# Make depth_anything_3 importable without pip install
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 from loop_utils.alignment_torch import (
     apply_sim3_direct_torch,
     depth_to_point_cloud_optimized_torch,
@@ -140,9 +146,13 @@ class DA3_Streaming:
         self.conf_threshold = 1.5
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = (
-            torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        )
+        self.is_cuda = torch.cuda.is_available()
+        if self.is_cuda:
+            self.dtype = (
+                torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+            )
+        else:
+            self.dtype = torch.float32
 
         self.img_dir = image_dir
         self.img_list = None
@@ -199,6 +209,18 @@ class DA3_Streaming:
 
         print("init done.")
 
+    @staticmethod
+    def _empty_cache():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _autocast_context(self):
+        import contextlib
+        if self.is_cuda:
+            return torch.cuda.amp.autocast(dtype=self.dtype)
+        else:
+            return contextlib.nullcontext()
+
     def get_loop_pairs(self):
         self.loop_detector.run()
         loop_list = self.loop_detector.get_loop_list()
@@ -210,10 +232,13 @@ class DA3_Streaming:
         os.makedirs(self.result_output_dir, exist_ok=True)
 
         chunk_start, chunk_end = self.chunk_indices[chunk_idx]
+        num_chunks = len(self.chunk_indices)
 
-        if chunk_idx == 0:
+        if num_chunks == 1:
+            save_indices = list(range(0, chunk_end - chunk_start))
+        elif chunk_idx == 0:
             save_indices = list(range(0, chunk_end - chunk_start - self.overlap_e))
-        elif chunk_idx == len(self.chunk_indices) - 1:
+        elif chunk_idx == num_chunks - 1:
             save_indices = list(range(self.overlap_s, chunk_end - chunk_start))
         else:
             save_indices = list(range(self.overlap_s, chunk_end - chunk_start - self.overlap_e))
@@ -264,15 +289,17 @@ class DA3_Streaming:
             "ref_view_strategy" if not is_loop else "ref_view_strategy_loop"
         ]
 
-        torch.cuda.empty_cache()
+        self._empty_cache()
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=self.dtype):
+            with self._autocast_context():
                 images = chunk_image_paths
                 # images: ['xxx.png', 'xxx.png', ...]
 
                 predictions = self.model.inference(images, ref_view_strategy=ref_view_strategy)
 
                 predictions.depth = np.squeeze(predictions.depth)
+                if predictions.depth.ndim == 2:
+                    predictions.depth = predictions.depth[np.newaxis, ...]
                 predictions.conf -= 1.0
 
                 print(predictions.processed_images.shape)  # [N, H, W, 3] uint8
@@ -280,7 +307,7 @@ class DA3_Streaming:
                 print(predictions.conf.shape)  # [N, H, W] float32
                 print(predictions.extrinsics.shape)  # [N, 3, 4] float32 (w2c)
                 print(predictions.intrinsics.shape)  # [N, 3, 3] float32
-        torch.cuda.empty_cache()
+        self._empty_cache()
 
         # Save predictions to disk instead of keeping in memory
         if is_loop:
@@ -540,7 +567,7 @@ class DA3_Streaming:
             cur_predictions = self.process_single_chunk(
                 self.chunk_indices[chunk_idx], chunk_idx=chunk_idx
             )
-            torch.cuda.empty_cache()
+            self._empty_cache()
 
             if chunk_idx > 0:
                 print(
@@ -590,7 +617,7 @@ class DA3_Streaming:
             self.loop_list = self.get_loop_pairs()
             del self.loop_detector  # Save GPU Memory
 
-            torch.cuda.empty_cache()
+            self._empty_cache()
 
             print("Loop SIM(3) estimating...")
             loop_results = process_loop_list(
@@ -694,6 +721,32 @@ class DA3_Streaming:
                 predictions.depth *= s
                 self.save_depth_conf_result(predictions, chunk_idx + 1, s, R, t)
 
+        # Handle single-chunk sequences
+        if len(self.chunk_indices) == 1:
+            chunk_data = np.load(
+                os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
+            ).item()
+            # fix depth dim
+            if chunk_data.depth.ndim == 2:
+                chunk_data.depth = chunk_data.depth[np.newaxis, ...]
+            points = depth_to_point_cloud_vectorized(
+                chunk_data.depth, chunk_data.intrinsics, chunk_data.extrinsics
+            )
+            points[..., 1] *= -1  # Y flip
+            points[..., 2] *= -1  # Z flip
+            colors = chunk_data.processed_images
+            confs = chunk_data.conf
+            ply_path = os.path.join(self.pcd_dir, "0_pcd.ply")
+            save_confident_pointcloud_batch(
+                points=points, colors=colors, confs=confs,
+                output_path=ply_path,
+                conf_threshold=np.mean(confs)
+                * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+            )
+            if self.config["Model"]["save_depth_conf_result"]:
+                self.save_depth_conf_result(chunk_data, 0, 1, np.eye(3), np.array([0, 0, 0]))
+
         self.save_camera_poses()
 
         print("Done.")
@@ -737,9 +790,13 @@ class DA3_Streaming:
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
 
-        for i, idx in enumerate(
-            range(first_chunk_range[0], first_chunk_range[1] - self.overlap_e)
-        ):
+        # Handle single-chunk or small-frame sequences
+        if len(self.all_camera_poses) == 1:
+            first_end = first_chunk_range[1]
+        else:
+            first_end = first_chunk_range[1] - self.overlap_e
+
+        for i, idx in enumerate(range(first_chunk_range[0], first_end)):
             w2c = np.eye(4)
             w2c[:3, :] = first_chunk_extrinsics[i]
             c2w = np.linalg.inv(w2c)
@@ -916,7 +973,8 @@ if __name__ == "__main__":
     da3_streaming.close()
 
     del da3_streaming
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
 
     all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")

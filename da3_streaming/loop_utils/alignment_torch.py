@@ -17,11 +17,13 @@
 import numpy as np
 import torch
 
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def weighted_estimate_se3_torch(source_points, target_points, weights):
-    source_points = torch.from_numpy(source_points).cuda().float()
-    target_points = torch.from_numpy(target_points).cuda().float()
-    weights = torch.from_numpy(weights).cuda().float()
+    source_points = torch.from_numpy(source_points).to(_DEVICE).float()
+    target_points = torch.from_numpy(target_points).to(_DEVICE).float()
+    weights = torch.from_numpy(weights).to(_DEVICE).float()
 
     total_weight = torch.sum(weights)
     if total_weight < 1e-6:
@@ -50,9 +52,9 @@ def weighted_estimate_se3_torch(source_points, target_points, weights):
 
 def weighted_estimate_sim3_torch(source_points, target_points, weights):
 
-    source_points = torch.from_numpy(source_points).cuda().float()
-    target_points = torch.from_numpy(target_points).cuda().float()
-    weights = torch.from_numpy(weights).cuda().float()
+    source_points = torch.from_numpy(source_points).to(_DEVICE).float()
+    target_points = torch.from_numpy(target_points).to(_DEVICE).float()
+    weights = torch.from_numpy(weights).to(_DEVICE).float()
 
     total_weight = torch.sum(weights)
     if total_weight < 1e-6:
@@ -93,7 +95,7 @@ def weighted_estimate_sim3_numba_torch(source_points, target_points, weights, al
     if s < 0:
         raise ValueError("Total weight too small for meaningful estimation")
 
-    H_torch = torch.from_numpy(H).cuda().float()
+    H_torch = torch.from_numpy(H).to(_DEVICE).float()
     U, _, Vt = torch.linalg.svd(H_torch)
 
     U = U.cpu().numpy()
@@ -118,8 +120,8 @@ def weighted_estimate_sim3_numba_torch(source_points, target_points, weights, al
 
 def huber_loss_torch(r, delta):
 
-    r_torch = torch.from_numpy(r).cuda().float()
-    delta_torch = torch.tensor(delta, device="cuda", dtype=torch.float32)
+    r_torch = torch.from_numpy(r).to(_DEVICE).float()
+    delta_torch = torch.tensor(delta, device=_DEVICE, dtype=torch.float32)
 
     abs_r = torch.abs(r_torch)
     result = torch.where(
@@ -131,8 +133,8 @@ def huber_loss_torch(r, delta):
 
 def compute_residuals_torch(tgt, transformed):
 
-    tgt_torch = torch.from_numpy(tgt).cuda().float()
-    transformed_torch = torch.from_numpy(transformed).cuda().float()
+    tgt_torch = torch.from_numpy(tgt).to(_DEVICE).float()
+    transformed_torch = torch.from_numpy(transformed).to(_DEVICE).float()
 
     residuals = torch.sqrt(torch.sum((tgt_torch - transformed_torch) ** 2, dim=1))
     return residuals.cpu().numpy()
@@ -140,8 +142,8 @@ def compute_residuals_torch(tgt, transformed):
 
 def compute_huber_weights_torch(residuals, delta):
 
-    residuals_torch = torch.from_numpy(residuals).cuda().float()
-    delta_torch = torch.tensor(delta, device="cuda", dtype=torch.float32)
+    residuals_torch = torch.from_numpy(residuals).to(_DEVICE).float()
+    delta_torch = torch.tensor(delta, device=_DEVICE, dtype=torch.float32)
 
     weights = torch.ones_like(residuals_torch)
     mask = residuals_torch > delta_torch
@@ -152,10 +154,10 @@ def compute_huber_weights_torch(residuals, delta):
 
 def apply_transformation_torch(src, s, R, t):
 
-    src_torch = torch.from_numpy(src).cuda().float()
-    R_torch = torch.from_numpy(R).cuda().float()
-    t_torch = torch.from_numpy(t).cuda().float()
-    s_torch = torch.tensor(s, device="cuda", dtype=torch.float32)
+    src_torch = torch.from_numpy(src).to(_DEVICE).float()
+    R_torch = torch.from_numpy(R).to(_DEVICE).float()
+    t_torch = torch.from_numpy(t).to(_DEVICE).float()
+    s_torch = torch.tensor(s, device=_DEVICE, dtype=torch.float32)
 
     transformed = s_torch * (src_torch @ R_torch.T) + t_torch
     return transformed.cpu().numpy()

@@ -1,13 +1,13 @@
 Weights:
-  DA3: './weights/model.safetensors'
-  DA3_CONFIG: './weights/config.json'
+  DA3: './weights_small/model.safetensors'
+  DA3_CONFIG: './weights_small/config.json'
   SALAD: './weights/dino_salad.ckpt'
 
 Model:
   chunk_size: 120
   overlap: 60
   loop_chunk_size: 20 # imgs of loop chunk = 2 * loop_chunk_size
-  loop_enable: True
+  loop_enable: False
   useDBoW: False
   delete_temp_files: True
   align_lib: 'triton' # choose among 'triton' (GPU), 'torch' (GPU), 'numba' (CPU) or 'numpy' (CPU)
