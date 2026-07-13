@@ -38,3 +38,6 @@ temp*.png
 venv/
 weights/
 weights_small/
+output/
+test_debug/
+workspace/
