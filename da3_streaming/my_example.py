@@ -6,10 +6,11 @@ from PySide6.QtWidgets import (
     QFrame, QSlider, QCheckBox, QComboBox, QLineEdit,
     QGridLayout, QScrollArea
 )
-from PySide6.QtCore import Qt, QSize, QThread, Signal
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer, QTime
 from PySide6.QtGui import QPixmap, QImage, QColor, QPalette
 
 import os, glob, shutil, socket, threading, time
+import numpy as np
 import trimesh
 from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -41,6 +42,63 @@ class FileCopyWorker(QThread):
 
 
 # ============================================================
+# 视频抽帧线程：用 cv2 读取视频，按帧率抽帧，实时报告进度
+# ============================================================
+class VideoFrameWorker(QThread):
+    progress = Signal(int)
+    finished = Signal(str)
+    error    = Signal(str)
+
+    def __init__(self, video_path, dest_dir, fps=2, max_width=640):
+        super().__init__()
+        self.video_path = video_path
+        self.dest_dir   = dest_dir
+        self.fps        = fps
+        self.max_width  = max_width
+
+    def run(self):
+        try:
+            import cv2
+            cap = cv2.VideoCapture(self.video_path)
+            if not cap.isOpened():
+                self.error.emit(f"无法打开视频: {self.video_path}")
+                return
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_fps    = cap.get(cv2.CAP_PROP_FPS) or 30
+            interval     = max(1, int(video_fps / self.fps))
+
+            saved = 0
+            idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if idx % interval == 0:
+                    h, w = frame.shape[:2]
+                    if w > self.max_width:
+                        scale = self.max_width / w
+                        frame = cv2.resize(frame, (self.max_width, int(h * scale)))
+                    out_path = os.path.join(
+                        self.dest_dir, f"frame_{saved:06d}.png")
+                    cv2.imwrite(out_path, frame)
+                    saved += 1
+
+                idx += 1
+                if total_frames > 0:
+                    self.progress.emit(int(idx / total_frames * 100))
+                self.msleep(1)
+
+            cap.release()
+            self.progress.emit(100)
+            self.finished.emit(self.dest_dir)
+
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+
+# ============================================================
 # 后台工作线程：DA3 推理
 # ============================================================
 class DA3Worker(QThread):
@@ -54,11 +112,13 @@ class DA3Worker(QThread):
     # ============================================================
     # 接收图片目录、输出目录、配置文件路径
     # ============================================================    
-    def __init__(self, image_dir, output_dir, config_path):
+    def __init__(self, image_dir, output_dir, config_path, sample_ratio=1.0, model_cache=None):
         super().__init__()
-        self.image_dir   = image_dir
-        self.output_dir  = output_dir
-        self.config_path = config_path
+        self.image_dir    = image_dir
+        self.output_dir   = output_dir
+        self.config_path  = config_path
+        self.sample_ratio = sample_ratio
+        self.model_cache  = model_cache  # 外部传入的预加载模型
 
     def _log(self, msg, pct):
         self.progress.emit(msg, pct)
@@ -73,21 +133,15 @@ class DA3Worker(QThread):
 
             import importlib.util
 
-            # 加载 da3_streaming.py（文件名 = 目录名，用 importlib 避免歧义）
             _spec = importlib.util.spec_from_file_location(
                 "da3_streaming", os.path.join(_here, "da3_streaming.py")
             )
             _mod = importlib.util.module_from_spec(_spec)
             _spec.loader.exec_module(_mod)
-
             DA3_Streaming = _mod.DA3_Streaming
-
             from loop_utils.config_utils import load_config
-
-            # 关键：移除 da3_streaming/ 防止模型加载时模块冲突导致段错误
             sys.path.remove(_here)
 
-            self._log("加载模型...", 5)
             config = load_config(self.config_path)
 
             # 获取所有图片文件路径
@@ -128,7 +182,7 @@ class DA3Worker(QThread):
                     pose_file=poses_file,
                     output_ply=ply_file,
                     conf_threshold_coef=0.5,
-                    sample_ratio=1.0,
+                    sample_ratio=self.sample_ratio,
                 )
                 self._log("完成", 100)
             else:
@@ -283,7 +337,11 @@ class GradioLikeApp(QMainWindow):
         splitter.setSizes([200, 1200])                      # 设置左右面板初始宽度：左300px，右1100px
         main_layout.addWidget(splitter)                     # 将分割器添加到主布局
 
-        self.create_status_bar()                            # 调用create_status_bar方法创建状态栏
+        self.create_status_bar()
+
+        # 预加载模型（单次加载，后续推理复用）
+        self._cached_model = None  # 延迟加载，首次推理时初始化
+        self._model_loaded = False
 
     # ============================================================
     # 创建顶部标题栏
@@ -337,7 +395,20 @@ class GradioLikeApp(QMainWindow):
         g = QGroupBox("上传图片/视频")
         gl = QVBoxLayout(g)
 
-        gl.addWidget(QPushButton("上传视频"))
+        self.upload_video_btn = QPushButton("上传视频")
+        self.upload_video_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        self.upload_video_btn.clicked.connect(self._on_upload_video)
+        gl.addWidget(self.upload_video_btn)
         self.upload_image_btn = QPushButton("上传图片")
         self.upload_image_btn.setStyleSheet("""
             QPushButton {
@@ -353,32 +424,101 @@ class GradioLikeApp(QMainWindow):
         self.upload_image_btn.clicked.connect(self._on_upload_images)
         gl.addWidget(self.upload_image_btn)
 
-        # 上传进度条
-        self.upload_progress = QFrame()
-        self.upload_progress.setStyleSheet("background-color: #e0e0e0; border-radius: 3px;")
-        self.upload_progress.setFixedHeight(6)
-        self.upload_progress.hide()
-        gl.addWidget(self.upload_progress)
-        self.upload_progress_fill = QFrame(self.upload_progress)
-        self.upload_progress_fill.setStyleSheet("background-color: #2196F3; border-radius: 3px;")
-        self.upload_progress_fill.setFixedHeight(6)
-        self.upload_progress_fill.setFixedWidth(0)
-
         layout.addWidget(g)
 
         # --- 配置 ---
-        cg = QGroupBox("模型配置")
-        cl = QGridLayout(cg)
-        cl.addWidget(QLabel("模型:"), 0, 0)
-        cmb = QComboBox()
-        cmb.addItems(["depth_anything_v3_small", "depth_anything_v3_base", "depth_anything_v3_large"])
-        cl.addWidget(cmb, 0, 1)
-        cl.addWidget(QLabel("设备:"), 1, 0)
-        d2 = QComboBox()
-        d2.addItems(["cuda:0", "cpu"])
-        cl.addWidget(d2, 1, 1)
+        cg = QGroupBox("可视化选项")
+        cl = QVBoxLayout(cg)
+        cl.setSpacing(8)
+
+        top = QHBoxLayout()
+        label = QLabel("过滤器百分比")
+        label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        top.addWidget(label)
+        top.addStretch()
+        self.value_label = QLabel("[ 90% ]")
+        self.value_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #2196F3;"
+            "background: #e8f0fe; border-radius: 4px; padding: 2px 8px;")
+        top.addWidget(self.value_label)
+        self.reset_btn = QPushButton("↻")
+        self.reset_btn.setFixedWidth(60)
+        self.reset_btn.setStyleSheet(
+            "QPushButton { background-color: #6c757d; }"
+            "QPushButton:hover { background: #5a6268; }"
+            "QPushButton:pressed { background: #495057; }")
+        self.reset_btn.clicked.connect(self.on_reset_clicked)
+        top.addWidget(self.reset_btn)
+        cl.addLayout(top)
+
+        sl = QHBoxLayout()
+        min_l = QLabel("0")
+        min_l.setStyleSheet("color: #999; font-size: 11px;")
+        sl.addWidget(min_l)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.setValue(90)
+        self.slider.setStyleSheet(
+            "QSlider::groove:horizontal { height: 6px; background: #d0d0d0; border-radius: 3px; }"
+            "QSlider::handle:horizontal { background: #2196F3; width: 16px; height: 16px;"
+            "margin: -5px 0; border-radius: 8px; }"
+            "QSlider::handle:horizontal:hover { background: #1976D2; }"
+            "QSlider::sub-page:horizontal { background: #2196F3; border-radius: 3px; }")
+        self.slider.valueChanged.connect(self.on_slider_changed)
+        sl.addWidget(self.slider)
+        max_l = QLabel("100")
+        max_l.setStyleSheet("color: #999; font-size: 11px;")
+        sl.addWidget(max_l)
+        cl.addLayout(sl)
+
+        # 分隔线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #e0e0e0;")
+        cl.addWidget(sep)
+
+        ftop = QHBoxLayout()
+        flabel = QLabel("抽取帧率")
+        flabel.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
+        ftop.addWidget(flabel)
+        ftop.addStretch()
+        self.fps_label = QLabel("[ 2 fps ]")
+        self.fps_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #2196F3;"
+            "background: #e8f0fe; border-radius: 4px; padding: 2px 8px;")
+        ftop.addWidget(self.fps_label)
+        self.fps_reset_btn = QPushButton("↻")
+        self.fps_reset_btn.setFixedWidth(60)
+        self.fps_reset_btn.setStyleSheet(
+            "QPushButton { background: #6c757d; color: white; border: none;"
+            "padding: 5px 12px; border-radius: 4px; font-size: 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #5a6268; }"
+            "QPushButton:pressed { background: #495057; }")
+        self.fps_reset_btn.clicked.connect(self.on_fps_reset_clicked)
+        ftop.addWidget(self.fps_reset_btn)
+        cl.addLayout(ftop)
+
+        fsl = QHBoxLayout()
+        fmin = QLabel("0.1")
+        fmin.setStyleSheet("color: #999; font-size: 11px;")
+        fsl.addWidget(fmin)
+        self.fps_slider = QSlider(Qt.Horizontal)
+        self.fps_slider.setRange(1, 100)
+        self.fps_slider.setValue(20)
+        self.fps_slider.setStyleSheet(
+            "QSlider::groove:horizontal { height: 6px; background: #d0d0d0; border-radius: 3px; }"
+            "QSlider::handle:horizontal { background: #2196F3; width: 16px; height: 16px;"
+            "margin: -5px 0; border-radius: 8px; }"
+            "QSlider::handle:horizontal:hover { background: #1976D2; }"
+            "QSlider::sub-page:horizontal { background: #2196F3; border-radius: 3px; }")
+        self.fps_slider.valueChanged.connect(self.on_fps_slider_changed)
+        fsl.addWidget(self.fps_slider)
+        fmax = QLabel("10")
+        fmax.setStyleSheet("color: #999; font-size: 11px;")
+        fsl.addWidget(fmax)
+        cl.addLayout(fsl)
+
         layout.addWidget(cg)
-        layout.addStretch()
 
         # --- 操作 ---
         ag = QGroupBox("操作")
@@ -386,19 +526,44 @@ class GradioLikeApp(QMainWindow):
         self.run_btn = QPushButton("▶️ 运行推理")
         self.run_btn.setStyleSheet("padding: 12px; font-size: 14px;")
         self.run_btn.clicked.connect(self._on_run_inference)
-        self.run_btn.setEnabled(False)  # 先灰掉，上传图片后才可用
+        self.run_btn.setEnabled(False)
         al.addWidget(self.run_btn)
         row = QHBoxLayout()
-        s = QPushButton("⏹️ 停止"); s.setObjectName("danger"); row.addWidget(s)
-        c = QPushButton("🗑️ 清空全部"); c.setObjectName("secondary"); row.addWidget(c)
+        self.clear_btn = QPushButton("🗑️ 清空全部")
+        self.clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6c757d; padding: 12px; font-size: 14px;
+                color: white; border: none; border-radius: 4px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #5a6268; }
+            QPushButton:pressed { background-color: #4e555b; }
+        """)
+        self.clear_btn.clicked.connect(self._on_clear_all)
+        row.addWidget(self.clear_btn)
         al.addLayout(row)
         layout.addWidget(ag)
 
         # --- 进度 ---
         pg = QGroupBox("进度")
         pl = QVBoxLayout(pg)
-        self.progress_label = QLabel("状态: 就绪")
-        self.progress_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        self.upload_progress_label = QLabel("上传: 等待")
+        self.upload_progress_label.setStyleSheet("color: #666; font-size: 11px;")
+        pl.addWidget(self.upload_progress_label)
+        from PySide6.QtWidgets import QProgressBar
+        self.upload_bar = QProgressBar()
+        self.upload_bar.setRange(0, 100)
+        self.upload_bar.setValue(0)
+        self.upload_bar.setFormat("上传 %p%")
+        self.upload_bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #d0d0d0; border-radius: 3px;
+                background: #e8e8e8; height: 12px; text-align: center; font-size: 10px; }
+            QProgressBar::chunk { background-color: #2196F3; border-radius: 2px; }
+        """)
+        pl.addWidget(self.upload_bar)
+
+        # 推理进度标签
+        self.progress_label = QLabel("推理: 就绪")
+        self.progress_label.setStyleSheet("color: #4CAF50; font-weight: bold; margin-top: 6px;")
         pl.addWidget(self.progress_label)
         self.progress_track = QFrame()
         self.progress_track.setStyleSheet("background-color: #e0e0e0; border-radius: 4px;")
@@ -498,83 +663,190 @@ class GradioLikeApp(QMainWindow):
         self.pointcloud_viewer.setHtml(f"""
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>3D Viewer</title>
-<style>
-  html, body {{ margin:0; padding:0; overflow:hidden; height:100%; background:#222; }}
-  #canvas {{ width:100%; height:100%; outline:none; }}
-  #info {{ position:absolute; bottom:10px; right:10px; color:#888;
-           font-family:sans-serif; font-size:11px; pointer-events:none; }}
-  #loading {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+<head>
+    <meta charset="utf-8">
+    <title>3D Viewer</title>
+    <style>
+        /* 全局样式：无内外边距，隐藏溢出，全屏高度，深色背景 */
+        html, body {{ margin:0; padding:0; overflow:hidden; height:100%; background:#222; }}
+        #canvas {{ width:100%; height:100%; outline:none; }}
+        #loading {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
               color:#ccc; font-family:sans-serif; font-size:14px; }}
-</style>
+    </style>
 </head>
 <body>
-  <canvas id="canvas"></canvas>
-  <div id="loading">加载中...</div>
-  <div id="info">鼠标左键旋转 | 滚轮缩放 | 右键平移</div>
-  <script src="https://cdn.babylonjs.com/babylon.js"></script>
-  <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
-  <script>
-    const canvas = document.getElementById("canvas");
-    const engine = new BABYLON.Engine(canvas, true, {{ preserveDrawingBuffer: true, stencil: true }});
-    const scene = new BABYLON.Scene(engine);
-    scene.clearColor = new BABYLON.Color4(0.15, 0.15, 0.2, 1);
+    <canvas id="canvas"></canvas>
+    <div id="loading">Loading...</div>
+    <!-- ========== 加载 Babylon.js 库 ========== -->
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <script>
+        const canvas = document.getElementById("canvas");
+        const engine = new BABYLON.Engine(canvas, true, {{ preserveDrawingBuffer: true, stencil: true, antialias: true }});
+        const scene = new BABYLON.Scene(engine);
+        scene.clearColor = new BABYLON.Color4(0.15, 0.15, 0.18, 1);
 
-    const camera = new BABYLON.ArcRotateCamera("cam", Math.PI/3, Math.PI/3, 5,
-                                               BABYLON.Vector3.Zero(), scene);
-    camera.attachControl(canvas, true);
-    camera.lowerRadiusLimit = 0.0001;   /* 允许缩放到非常近 */
-    camera.upperRadiusLimit = 10000;    /* 允许缩放到非常远 */
-    camera.minZ = 0.0001;               /* 近裁剪面极小，防止切掉模型 */
-    camera.wheelPrecision = 10;         /* 滚轮更灵敏 */
+        // === 灯光 (Sandbox 同款) ===
+        const light = new BABYLON.HemisphericLight("light",
+            new BABYLON.Vector3(0, 1, 0), scene);
+        light.intensity = 0.7;
 
-    const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0,1,0), scene);
-    light.intensity = 0.8;
+        // === 相机（正视图角度，距离适中） ===
+        const camera = new BABYLON.ArcRotateCamera(
+            "cam",
+            Math.PI/2,          // alpha: 水平旋转角度90度
+            Math.PI/2.2,        // beta:  垂直旋转角度82度
+            5,                  // 初始半径（加载后自动适配）
+            BABYLON.Vector3.Zero(), scene);
+        camera.attachControl(canvas, true);
+        camera.lowerRadiusLimit = 0.0001;
+        camera.upperRadiusLimit = 10000;
+        camera.minZ = 0.0001;
+        camera.wheelPrecision = 50;       // 滚轮缩放（越大缩放越慢（更精确））
+        camera.angularSensibilityX = 1000;
+        camera.angularSensibilityY = 1000;
+        camera.panningSensibility = 1000;
 
-    BABYLON.SceneLoader.ImportMesh("", "", "{glb_url}", scene,
-      function(meshes) {{
-        document.getElementById("loading").style.display = "none";
-        if (meshes.length > 0) {{
-          const bb = meshes[0].getBoundingInfo().boundingBox;
-          const center = bb.center;
-          const size = bb.extendSize.length();
-          camera.target = center;
-          camera.radius = Math.max(size * 2.5, 0.1);
-          camera.lowerRadiusLimit = size * 0.001;
-          console.log('Model loaded: center', center, 'size', size, 'radius', camera.radius);
-        }}
-      }},
-      function(evt) {{
-        if (evt.lengthComputable) {{
-          const pct = Math.round(evt.loaded * 100 / evt.total);
-          document.getElementById("loading").textContent = "加载中... " + pct + "%";
-        }}
-      }},
-      function() {{
-        document.getElementById("loading").textContent = "加载失败";
-      }}
-    );
+        BABYLON.SceneLoader.ImportMesh(
+            "",
+            "",
+            "{glb_url}",
+            scene,
 
-    engine.runRenderLoop(() => scene.render());
-    window.addEventListener("resize", () => engine.resize());
-  </script>
+            function(meshes) {{
+                document.getElementById("loading").style.display = "none";
+                if (meshes.length > 0) {{
+                    const bb = meshes[0].getBoundingInfo().boundingBox;
+                    const center = bb.center;
+                    const size = bb.extendSize.length();
+                    camera.target = center;
+                    camera.radius = Math.max(size * 0.5, 0.1);
+                    camera.lowerRadiusLimit = size * 0.00001;
+                }}
+            }},
+            function(evt) {{
+                if (evt.lengthComputable) {{
+                    document.getElementById("loading").textContent =
+                        "Loading " + Math.round(evt.loaded*100/evt.total) + "%";
+                }}
+            }},
+            function() {{ document.getElementById("loading").textContent = "Load Failed"; }}
+        );
+
+        engine.runRenderLoop(() => scene.render());
+        window.addEventListener("resize", () => engine.resize());
+    </script>
 </body>
 </html>""")
 
     def _tab_depth(self):
         t = QWidget()
         l = QVBoxLayout(t)
-        f = QFrame()
-        f.setStyleSheet("background-color: #2c3e50; border-radius: 8px; border: 2px solid #34495e;")
-        f.setMinimumHeight(500)
-        hl = QHBoxLayout(f)
-        for text in ["RGB图像显示区域", "深度图像显示区域"]:
-            lb = QLabel(text)
-            lb.setAlignment(Qt.AlignCenter)
-            lb.setStyleSheet("color: #ecf0f1; font-size: 18px; background: transparent;")
-            hl.addWidget(lb)
-        l.addWidget(f)
+
+        # --- 导航栏 ---
+        nav = QHBoxLayout()
+        self.depth_prev_btn = QPushButton("< 上一张")
+        self.depth_prev_btn.setObjectName("secondary")
+        self.depth_prev_btn.clicked.connect(self._on_depth_prev)
+        self.depth_prev_btn.setEnabled(False)
+        nav.addWidget(self.depth_prev_btn)
+
+        self.depth_combo = QComboBox()
+        self.depth_combo.setEnabled(False)
+        self.depth_combo.currentIndexChanged.connect(self._on_depth_combo)
+        nav.addWidget(self.depth_combo, 1)
+
+        self.depth_next_btn = QPushButton("下一张 >")
+        self.depth_next_btn.setObjectName("secondary")
+        self.depth_next_btn.clicked.connect(self._on_depth_next)
+        self.depth_next_btn.setEnabled(False)
+        nav.addWidget(self.depth_next_btn)
+        l.addLayout(nav)
+
+        # --- 图像显示区 ---
+        disp = QHBoxLayout()
+        # 左: RGB
+        self.rgb_label = QLabel("RGB 图像")
+        self.rgb_label.setAlignment(Qt.AlignCenter)
+        self.rgb_label.setMinimumHeight(400)
+        self.rgb_label.setStyleSheet(
+            "background-color: #1a1a2e; color: #888; border-radius: 6px; font-size: 14px;")
+        disp.addWidget(self.rgb_label)
+        # 右: 深度图
+        self.depth_label = QLabel("深度图像")
+        self.depth_label.setAlignment(Qt.AlignCenter)
+        self.depth_label.setMinimumHeight(400)
+        self.depth_label.setStyleSheet(
+            "background-color: #1a1a2e; color: #888; border-radius: 6px; font-size: 14px;")
+        disp.addWidget(self.depth_label)
+        l.addLayout(disp)
+
+        # 初始化状态
+        self.depth_results_dir = None
+        self.depth_frame_list = []
+        self.depth_frame_idx = 0
         return t
+
+    # ============================================================
+    # 深度图导航
+    # ============================================================
+    def _init_depth_viewer(self, results_dir):
+        """推理完成后初始化深度图查看器"""
+        self.depth_results_dir = results_dir
+        self.depth_frame_list = sorted(
+            glob.glob(os.path.join(results_dir, "frame_*.npz")))
+        self.depth_frame_list.sort(
+            key=lambda x: int(os.path.basename(x).split("_")[1].split(".")[0]))
+        self.depth_frame_idx = 0
+
+        n = len(self.depth_frame_list)
+        self.depth_combo.clear()
+        self.depth_combo.addItems([f"第 {i+1} 张" for i in range(n)])
+        self.depth_combo.setEnabled(n > 0)
+        self.depth_prev_btn.setEnabled(n > 1)
+        self.depth_next_btn.setEnabled(n > 1)
+        if n > 0:
+            self._show_depth_frame(0)
+
+    def _show_depth_frame(self, idx):
+        """显示第 idx 帧的 RGB 和深度图"""
+        if idx < 0 or idx >= len(self.depth_frame_list):
+            return
+        self.depth_frame_idx = idx
+        self.depth_combo.blockSignals(True)
+        self.depth_combo.setCurrentIndex(idx)
+        self.depth_combo.blockSignals(False)
+
+        npz = np.load(self.depth_frame_list[idx])
+        rgb = npz["image"]
+        depth = npz["depth"]
+
+        # RGB → QPixmap
+        h, w, _ = rgb.shape
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        self.rgb_label.setPixmap(
+            QPixmap.fromImage(qimg).scaledToWidth(
+                400, Qt.SmoothTransformation))
+        self.rgb_label.setText("")
+
+        # 深度图 → 彩色 → QPixmap
+        from depth_anything_3.utils.visualize import visualize_depth
+        d_vis = visualize_depth(depth)
+        h2, w2, _ = d_vis.shape
+        qimg2 = QImage(d_vis.data, w2, h2, w2 * 3, QImage.Format_RGB888)
+        self.depth_label.setPixmap(
+            QPixmap.fromImage(qimg2).scaledToWidth(
+                400, Qt.SmoothTransformation))
+        self.depth_label.setText("")
+
+    def _on_depth_prev(self):
+        self._show_depth_frame(self.depth_frame_idx - 1)
+
+    def _on_depth_next(self):
+        self._show_depth_frame(self.depth_frame_idx + 1)
+
+    def _on_depth_combo(self, idx):
+        self._show_depth_frame(idx)
 
     def _tab_camera(self):
         t = QWidget()
@@ -608,11 +880,32 @@ class GradioLikeApp(QMainWindow):
         sb.setStyleSheet("background: #f8f9fa; color: #333; border-top: 1px solid #e0e0e0; padding: 4px 8px;")
         self.status_label = QLabel("✅ 就绪")
         sb.addWidget(self.status_label)
+        self.timer_label = QLabel("⏱ 00:00")
+        self.timer_label.setStyleSheet("font-weight: bold; color: #2196F3; margin-right: 10px;")
+        sb.addPermanentWidget(self.timer_label)
         sb.addPermanentWidget(QLabel("⚡ GPU: 未使用"))
+
+        # 计时钟（每秒刷新一次）
+        self._elapsed = 0
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._on_timer_tick)
 
     # ============================================================
     # 槽
     # ============================================================
+    def _on_timer_tick(self):
+        self._elapsed += 100
+        sec = self._elapsed / 1000.0
+        self.timer_label.setText(f"⏱ {sec:.1f}s")
+
+    def _start_timer(self):
+        self._elapsed = 0
+        self.timer_label.setText("⏱ 0.0s")
+        self._timer.start(100)  # 每 100ms 刷新一次
+
+    def _stop_timer(self):
+        self._timer.stop()
+
     def _set_progress(self, pct):
         w = int(self.progress_track.width() * pct / 100)
         self.progress_fill.setFixedWidth(max(2, w))
@@ -621,6 +914,37 @@ class GradioLikeApp(QMainWindow):
         self.status_label.setText(f"⏳ {msg}")
         self.progress_label.setText(f"状态: {msg} ({pct}%)")
         self._set_progress(pct)
+
+    # ============================================================
+    # 上传视频：选视频→抽帧→进度条
+    # ============================================================
+    def _on_upload_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择视频", "",
+            "Videos (*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.webm *.m4v)"
+        )
+        if not path:
+            return
+
+        self.pending_image_dir = os.path.join(
+            "workspace", "gui_session",
+            datetime.now().strftime("%Y%m%d_%H%M%S"), "images"
+        )
+        os.makedirs(self.pending_image_dir, exist_ok=True)
+
+        self.upload_image_btn.setEnabled(False)
+        self.upload_video_btn.setEnabled(False)
+        self.upload_bar.setValue(0)
+        self.upload_bar.show()
+        self.status_label.setText("⏳ 正在抽帧...")
+
+        fps = self.fps_slider.value() / 10.0  # 1-100 → 0.1-10.0
+        self._copy_worker = VideoFrameWorker(
+            path, self.pending_image_dir, fps=fps, max_width=640)
+        self._copy_worker.progress.connect(self._on_upload_progress)
+        self._copy_worker.finished.connect(self._on_upload_finished)
+        self._copy_worker.error.connect(self._on_upload_error)
+        self._copy_worker.start()
 
     # ============================================================
     # 上传图片：只复制文件，不推理
@@ -640,8 +964,8 @@ class GradioLikeApp(QMainWindow):
         os.makedirs(self.pending_image_dir, exist_ok=True)
 
         self.upload_image_btn.setEnabled(False)
-        self.upload_progress.show()
-        self.upload_progress_fill.setFixedWidth(0)
+        self.upload_bar.setValue(0)
+        self.upload_bar.show()
         self.status_label.setText("⏳ 正在上传...")
 
         self._copy_worker = FileCopyWorker(files, self.pending_image_dir)
@@ -651,22 +975,27 @@ class GradioLikeApp(QMainWindow):
         self._copy_worker.start()
 
     def _on_upload_progress(self, pct):
-        w = int(self.upload_progress.width() * pct / 100)
-        self.upload_progress_fill.setFixedWidth(max(2, w))
+        self.upload_bar.setValue(pct)
+        self.upload_progress_label.setText(f"上传: {pct}%")
         self.status_label.setText(f"⏳ 上传中... {pct}%")
 
     def _on_upload_finished(self, dest_dir):
         self.status_label.setText("📁 上传成功")
+        self.upload_bar.setValue(100)
+        self.upload_progress_label.setText("上传: ✅ 完成")
         self.upload_image_btn.setEnabled(True)
-        self.upload_progress.hide()
+        self.upload_video_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶️ 运行推理")
         self.progress_label.setText(f"状态: 就绪 (已选 {dest_dir})")
 
     def _on_upload_error(self, err):
         self.status_label.setText("❌ 上传失败")
+        self.upload_bar.setValue(0)
+        self.upload_progress_label.setText("上传: ❌ 失败")
         self.upload_image_btn.setEnabled(True)
-        self.upload_progress.hide()
+        self.upload_video_btn.setEnabled(True)
         self.progress_label.setText(f"错误: {err}")
 
     # ============================================================
@@ -678,12 +1007,17 @@ class GradioLikeApp(QMainWindow):
 
         self.run_btn.setEnabled(False)
         self.upload_image_btn.setEnabled(False)
+        self.upload_video_btn.setEnabled(False)
         self.status_label.setText("⏳ 正在推理...")
+        self._start_timer()
 
         work_dir = os.path.dirname(self.pending_image_dir)
+        sample_ratio = self.slider.value() / 100.0  # 0-100 → 0.0-1.0
         self._worker = DA3Worker(
             self.pending_image_dir, work_dir,
-            "da3_streaming/configs/base_config.yaml"
+            "da3_streaming/configs/base_config.yaml",
+            sample_ratio=sample_ratio,
+            model_cache=getattr(self, '_cached_model', None),
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_da3_finished)
@@ -691,11 +1025,19 @@ class GradioLikeApp(QMainWindow):
         self._worker.start()
 
     def _on_da3_finished(self, output_dir, glb_path):
+        self._stop_timer()
         self.status_label.setText("✅ 推理完成")
         self.progress_label.setText("状态: 完成 (100%)")
         self._set_progress(100)
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶️ 运行推理")
+        self.upload_image_btn.setEnabled(True)
+        self.upload_video_btn.setEnabled(True)
+
+        # 初始化深度图查看器
+        results_dir = os.path.join(output_dir, "results_output")
+        if os.path.exists(results_dir):
+            self._init_depth_viewer(results_dir)
 
         if glb_path and os.path.exists(glb_path):
             self.progress_label.setText(f"状态: 加载 3D 模型中 ({os.path.basename(glb_path)})")
@@ -704,11 +1046,94 @@ class GradioLikeApp(QMainWindow):
             self.progress_label.setText("状态: 完成（无 GLB 文件）")
 
     def _on_da3_error(self, err):
+        self._stop_timer()
         self.status_label.setText("❌ 推理失败")
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶️ 运行推理")
         self.upload_image_btn.setEnabled(True)
+        self.upload_video_btn.setEnabled(True)
         self.progress_label.setText(f"错误:\n{err[:200]}")
+        self.clear_btn.setEnabled(True)
+
+    # ============================================================
+    # 清空全部，恢复初始状态
+    # ============================================================
+    def _on_clear_all(self):
+        # 停止后台线程
+        if hasattr(self, '_worker') and self._worker.isRunning():
+            self._worker.terminate()
+            self._worker.wait()
+        if hasattr(self, '_copy_worker') and self._copy_worker.isRunning():
+            self._copy_worker.terminate()
+            self._copy_worker.wait()
+
+        # 关闭 HTTP 服务器
+        if self._http_server:
+            self._http_server.shutdown()
+            self._http_server = None
+            self._http_port = None
+
+        # 重置上传进度
+        self.upload_bar.setValue(0)
+        self.upload_progress_label.setText("上传: 等待")
+
+        # 重置推理进度
+        self._set_progress(0)
+        self.progress_label.setText("推理: 就绪")
+
+        # 重置上传按钮和运行按钮
+        self.upload_image_btn.setEnabled(True)
+        self.upload_video_btn.setEnabled(True)
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("▶️ 运行推理")
+        self.clear_btn.setEnabled(False)
+
+        # 清除 pending 数据
+        if hasattr(self, 'pending_image_dir'):
+            del self.pending_image_dir
+
+        # 重置 3D 点云查看器
+        self.pointcloud_viewer.setHtml("""
+            <html><body style="background:#1a1a2e;display:flex;align-items:center;
+            justify-content:center;height:100vh;margin:0;font-family:sans-serif">
+            <div style="text-align:center;color:#e0e0e0">
+            <div style="font-size:48px;margin-bottom:16px">&#127758;</div>
+            <div style="font-size:16px">3D点云查看器</div>
+            <div style="font-size:12px;color:#888;margin-top:8px">上传图片并运行推理后显示</div>
+            </div></body></html>
+        """)
+
+        # 重置深度图查看器
+        self.rgb_label.setPixmap(QPixmap())
+        self.rgb_label.setText("RGB 图像")
+        self.depth_label.setPixmap(QPixmap())
+        self.depth_label.setText("深度图像")
+        self.depth_combo.clear()
+        self.depth_combo.setEnabled(False)
+        self.depth_prev_btn.setEnabled(False)
+        self.depth_next_btn.setEnabled(False)
+        self.depth_results_dir = None
+        self.depth_frame_list = []
+        self.depth_frame_idx = 0
+
+        # 重置状态栏和计时
+        self._stop_timer()
+        self._elapsed = 0
+        self.timer_label.setText("⏱ 0.0s")
+        self.status_label.setText("✅ 就绪")
+
+    def on_slider_changed(self, value):
+        self.value_label.setText(f"[ {value}% ]")
+
+    def on_reset_clicked(self):
+        self.slider.setValue(90)
+
+    def on_fps_slider_changed(self, value):
+        fps = value / 10.0  # 1-100 → 0.1-10.0
+        self.fps_label.setText(f"[ {fps:.1f} fps ]")
+
+    def on_fps_reset_clicked(self):
+        self.fps_slider.setValue(20)  # 默认 2 fps
 
 
 # ============================================================
