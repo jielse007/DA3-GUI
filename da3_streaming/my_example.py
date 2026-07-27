@@ -99,6 +99,36 @@ class VideoFrameWorker(QThread):
 
 
 # ============================================================
+# 摄像头深度计算线程（复用缓存模型，加速推理）
+# ============================================================
+class CamDepthWorker(QThread):
+    finished = Signal(object)  # 传出 depth numpy array
+    error    = Signal(str)
+
+    def __init__(self, frame_bgr, cached_model):
+        super().__init__()
+        self.frame_bgr   = frame_bgr   # BGR numpy array
+        self.cached_model = cached_model  # 预加载的 DepthAnything3
+
+    def run(self):
+        try:
+            import tempfile, cv2
+            # 保存帧为临时文件
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                cv2.imwrite(f.name, self.frame_bgr)
+                tmp_path = f.name
+
+            prediction = self.cached_model.inference([tmp_path])
+            os.unlink(tmp_path)
+
+            depth = np.squeeze(prediction.depth)
+            self.finished.emit(depth)
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+
+# ============================================================
 # 后台工作线程：DA3 推理
 # ============================================================
 class DA3Worker(QThread):
@@ -340,8 +370,28 @@ class GradioLikeApp(QMainWindow):
         self.create_status_bar()
 
         # 预加载模型（单次加载，后续推理复用）
-        self._cached_model = None  # 延迟加载，首次推理时初始化
+        self._cached_model = None
         self._model_loaded = False
+        self._get_cached_model()
+
+    def _get_cached_model(self):
+        """单次加载 DepthAnything3 模型，存入缓存"""
+        if self._cached_model is not None:
+            return self._cached_model
+        import json, torch
+        _src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+        sys.path.insert(0, _src)
+        from depth_anything_3.api import DepthAnything3
+        from safetensors.torch import load_file
+        with open("weights_small/config.json") as f:
+            cfg = json.load(f)
+        model = DepthAnything3(**cfg)
+        weight = load_file("weights_small/model.safetensors")
+        model.load_state_dict(weight, strict=False)
+        model = model.cpu().eval()
+        self._cached_model = model
+        self._model_loaded = True
+        return model
 
     # ============================================================
     # 创建顶部标题栏
@@ -395,8 +445,8 @@ class GradioLikeApp(QMainWindow):
         g = QGroupBox("上传图片/视频")
         gl = QVBoxLayout(g)
 
-        self.upload_video_btn = QPushButton("上传视频")
-        self.upload_video_btn.setStyleSheet("""
+        self.upload_btn = QPushButton("上传图片/视频")
+        self.upload_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2196F3;
             }
@@ -407,22 +457,8 @@ class GradioLikeApp(QMainWindow):
                 background-color: #1565C0;
             }
         """)
-        self.upload_video_btn.clicked.connect(self._on_upload_video)
-        gl.addWidget(self.upload_video_btn)
-        self.upload_image_btn = QPushButton("上传图片")
-        self.upload_image_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:pressed {
-                background-color: #1565C0;
-            }
-        """)
-        self.upload_image_btn.clicked.connect(self._on_upload_images)
-        gl.addWidget(self.upload_image_btn)
+        self.upload_btn.clicked.connect(self._on_upload)
+        gl.addWidget(self.upload_btn)
 
         layout.addWidget(g)
 
@@ -585,7 +621,7 @@ class GradioLikeApp(QMainWindow):
 
         tabs.addTab(self._tab_pointcloud(), "3D点云")
         tabs.addTab(self._tab_depth(), "深度预测")
-        tabs.addTab(self._tab_camera(), "3DGS")
+        tabs.addTab(self._tab_camera(), "实时显示")
 
         layout.addWidget(tabs)
         return panel
@@ -614,9 +650,12 @@ class GradioLikeApp(QMainWindow):
         return t
 
     def _start_http_server(self, serve_dir):
-        """启动本地 HTTP 服务器以提供 GLB 文件（Babylon.js 需要 HTTP 加载）"""
+        """启动本地 HTTP 服务器（每次关闭旧服务，确保指向新目录）"""
+        # 关闭旧的 HTTP 服务
         if self._http_server:
-            return self._http_port
+            self._http_server.shutdown()
+            self._http_server = None
+            self._http_port = None
 
         # 找空闲端口
         for port in range(8765, 8790):
@@ -851,28 +890,112 @@ class GradioLikeApp(QMainWindow):
     def _tab_camera(self):
         t = QWidget()
         l = QVBoxLayout(t)
-        f = QFrame()
-        f.setStyleSheet("background: white; border-radius: 8px; border: 1px solid #e0e0e0;")
-        f.setMinimumHeight(300)
-        fl = QVBoxLayout(f)
-        headers = ["帧ID", "位置 (x,y,z)", "旋转 (四元数)", "深度中值"]
-        hl = QHBoxLayout()
-        for h in headers:
-            lb = QLabel(h)
-            lb.setStyleSheet("font-weight: bold; color: #2c3e50;")
-            hl.addWidget(lb)
-        fl.addLayout(hl)
-        for row in [
-            ("001", "(0.12, 0.34, 1.56)", "(0.71, 0.00, 0.71, 0.00)", "1.54m"),
-            ("002", "(0.45, 0.12, 1.78)", "(0.50, 0.50, 0.50, 0.50)", "2.34m"),
-        ]:
-            rw = QWidget()
-            rl = QHBoxLayout(rw)
-            for v in row:
-                lb = QLabel(v); lb.setStyleSheet("font-size: 12px; color: #333;"); rl.addWidget(lb)
-            fl.addWidget(rw)
-        l.addWidget(f)
+
+        # 左右分栏：摄像头 | 深度图
+        panels = QHBoxLayout()
+
+        # 左：摄像头
+        left = QVBoxLayout()
+        self.cam_label = QLabel("摄像头未开启")
+        self.cam_label.setAlignment(Qt.AlignCenter)
+        self.cam_label.setMinimumHeight(350)
+        self.cam_label.setStyleSheet(
+            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
+        left.addWidget(self.cam_label)
+        panels.addLayout(left)
+
+        # 右：深度图
+        right = QVBoxLayout()
+        self.cam_depth_label = QLabel("深度图")
+        self.cam_depth_label.setAlignment(Qt.AlignCenter)
+        self.cam_depth_label.setMinimumHeight(350)
+        self.cam_depth_label.setStyleSheet(
+            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
+        right.addWidget(self.cam_depth_label)
+        panels.addLayout(right)
+
+        l.addLayout(panels)
+
+        # 控制栏
+        ctrl = QHBoxLayout()
+        self.cam_toggle_btn = QPushButton("📷 开启摄像头")
+        self.cam_toggle_btn.setStyleSheet(
+            "QPushButton { background-color: #2196F3; padding: 6px 14px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #1976D2; }")
+        self.cam_toggle_btn.clicked.connect(self._on_toggle_camera)
+        ctrl.addWidget(self.cam_toggle_btn)
+        ctrl.addStretch()
+        l.addLayout(ctrl)
+
+        self._cam_cap = None
+        self._cam_depth_running = False
+        self._cam_timer = QTimer()
+        self._cam_timer.timeout.connect(self._on_cam_frame)
         return t
+
+    def _on_toggle_camera(self):
+        if self._cam_cap is not None:
+            self._cam_timer.stop()
+            self._cam_cap.release()
+            self._cam_cap = None
+            self._cam_depth_running = False
+            self.cam_label.setPixmap(QPixmap())
+            self.cam_label.setText("摄像头未开启")
+            self.cam_label.setStyleSheet(
+                "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
+            self.cam_toggle_btn.setText("📷 开启摄像头")
+        else:
+            import cv2
+            self._cam_cap = cv2.VideoCapture(0)
+            if not self._cam_cap.isOpened():
+                self._cam_cap = None
+                self.cam_label.setText("⚠️ 无法打开摄像头")
+                return
+            self.cam_label.setText("")
+            self.cam_label.setStyleSheet("background-color: #000; border-radius: 8px;")
+            self.cam_toggle_btn.setText("⏹ 关闭摄像头")
+            self._cam_timer.start(30)
+
+    def _on_cam_frame(self):
+        if self._cam_cap is None:
+            return
+        ret, frame = self._cam_cap.read()
+        if not ret:
+            return
+        # 显示 RGB 画面
+        rgb = np.ascontiguousarray(frame[:, :, ::-1])
+        h, w, _ = rgb.shape
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.cam_label.width(), self.cam_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.cam_label.setPixmap(pix)
+
+        # 自动触发深度计算（复用缓存模型，不再创建临时目录）
+        if not self._cam_depth_running and self._cached_model is not None:
+            self._cam_depth_running = True
+            self._cam_depth_worker = CamDepthWorker(frame, self._cached_model)
+            self._cam_depth_worker.finished.connect(self._on_cam_depth_finished)
+            self._cam_depth_worker.error.connect(self._on_cam_depth_error)
+            self._cam_depth_worker.start()
+
+    def _on_cam_depth_finished(self, depth):
+        self._cam_depth_running = False
+        from depth_anything_3.utils.visualize import visualize_depth
+        d_vis = visualize_depth(depth)
+        h, w, _ = d_vis.shape
+        qimg = QImage(d_vis.data, w, h, w * 3, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.cam_depth_label.width(), self.cam_depth_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.cam_depth_label.setPixmap(pix)
+        self.cam_depth_label.setText("")
+
+    def _on_cam_depth_error(self, err):
+        self._cam_depth_running = False
+        self.cam_depth_label.setText(f"❌ 错误:\n{err[:200]}")
+        self.cam_depth_label.setStyleSheet(
+            "background-color: #3a1a1a; color: #f88; border-radius: 8px; font-size: 12px;")
 
     # ----------------------------------------------------------
     def create_status_bar(self):
@@ -916,14 +1039,14 @@ class GradioLikeApp(QMainWindow):
         self._set_progress(pct)
 
     # ============================================================
-    # 上传视频：选视频→抽帧→进度条
+    # 统一上传：图片 → 复制文件 | 视频 → 抽帧
     # ============================================================
-    def _on_upload_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择视频", "",
-            "Videos (*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.webm *.m4v)"
+    def _on_upload(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择图片或视频", "",
+            "Images/Videos (*.png *.jpg *.jpeg *.bmp *.mp4 *.avi *.mov *.mkv *.flv *.wmv *.webm *.m4v)"
         )
-        if not path:
+        if not paths:
             return
 
         self.pending_image_dir = os.path.join(
@@ -932,43 +1055,23 @@ class GradioLikeApp(QMainWindow):
         )
         os.makedirs(self.pending_image_dir, exist_ok=True)
 
-        self.upload_image_btn.setEnabled(False)
-        self.upload_video_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
         self.upload_bar.setValue(0)
         self.upload_bar.show()
-        self.status_label.setText("⏳ 正在抽帧...")
 
-        fps = self.fps_slider.value() / 10.0  # 1-100 → 0.1-10.0
-        self._copy_worker = VideoFrameWorker(
-            path, self.pending_image_dir, fps=fps, max_width=640)
-        self._copy_worker.progress.connect(self._on_upload_progress)
-        self._copy_worker.finished.connect(self._on_upload_finished)
-        self._copy_worker.error.connect(self._on_upload_error)
-        self._copy_worker.start()
+        # 判断文件类型
+        video_exts = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"}
+        is_video = any(os.path.splitext(p)[1].lower() in video_exts for p in paths)
 
-    # ============================================================
-    # 上传图片：只复制文件，不推理
-    # ============================================================
-    def _on_upload_images(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "选择图片", "",
-            "Images (*.png *.jpg *.jpeg *.bmp)"
-        )
-        if not files:
-            return
+        if is_video and len(paths) == 1:
+            self.status_label.setText("⏳ 正在抽帧...")
+            fps = self.fps_slider.value() / 10.0
+            self._copy_worker = VideoFrameWorker(
+                paths[0], self.pending_image_dir, fps=fps, max_width=640)
+        else:
+            self.status_label.setText("⏳ 正在上传...")
+            self._copy_worker = FileCopyWorker(paths, self.pending_image_dir)
 
-        self.pending_image_dir = os.path.join(
-            "workspace", "gui_session",
-            datetime.now().strftime("%Y%m%d_%H%M%S"), "images"
-        )
-        os.makedirs(self.pending_image_dir, exist_ok=True)
-
-        self.upload_image_btn.setEnabled(False)
-        self.upload_bar.setValue(0)
-        self.upload_bar.show()
-        self.status_label.setText("⏳ 正在上传...")
-
-        self._copy_worker = FileCopyWorker(files, self.pending_image_dir)
         self._copy_worker.progress.connect(self._on_upload_progress)
         self._copy_worker.finished.connect(self._on_upload_finished)
         self._copy_worker.error.connect(self._on_upload_error)
@@ -983,8 +1086,8 @@ class GradioLikeApp(QMainWindow):
         self.status_label.setText("📁 上传成功")
         self.upload_bar.setValue(100)
         self.upload_progress_label.setText("上传: ✅ 完成")
-        self.upload_image_btn.setEnabled(True)
-        self.upload_video_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶️ 运行推理")
@@ -994,8 +1097,8 @@ class GradioLikeApp(QMainWindow):
         self.status_label.setText("❌ 上传失败")
         self.upload_bar.setValue(0)
         self.upload_progress_label.setText("上传: ❌ 失败")
-        self.upload_image_btn.setEnabled(True)
-        self.upload_video_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
         self.progress_label.setText(f"错误: {err}")
 
     # ============================================================
@@ -1006,8 +1109,8 @@ class GradioLikeApp(QMainWindow):
             return
 
         self.run_btn.setEnabled(False)
-        self.upload_image_btn.setEnabled(False)
-        self.upload_video_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
         self.status_label.setText("⏳ 正在推理...")
         self._start_timer()
 
@@ -1031,8 +1134,8 @@ class GradioLikeApp(QMainWindow):
         self._set_progress(100)
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶️ 运行推理")
-        self.upload_image_btn.setEnabled(True)
-        self.upload_video_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
 
         # 初始化深度图查看器
         results_dir = os.path.join(output_dir, "results_output")
@@ -1050,8 +1153,8 @@ class GradioLikeApp(QMainWindow):
         self.status_label.setText("❌ 推理失败")
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶️ 运行推理")
-        self.upload_image_btn.setEnabled(True)
-        self.upload_video_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
         self.progress_label.setText(f"错误:\n{err[:200]}")
         self.clear_btn.setEnabled(True)
 
@@ -1082,8 +1185,8 @@ class GradioLikeApp(QMainWindow):
         self.progress_label.setText("推理: 就绪")
 
         # 重置上传按钮和运行按钮
-        self.upload_image_btn.setEnabled(True)
-        self.upload_video_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
         self.run_btn.setEnabled(False)
         self.run_btn.setText("▶️ 运行推理")
         self.clear_btn.setEnabled(False)
@@ -1115,6 +1218,20 @@ class GradioLikeApp(QMainWindow):
         self.depth_results_dir = None
         self.depth_frame_list = []
         self.depth_frame_idx = 0
+
+        # 关闭摄像头
+        if hasattr(self, '_cam_cap') and self._cam_cap is not None:
+            self._cam_timer.stop()
+            self._cam_cap.release()
+            self._cam_cap = None
+            self.cam_label.setPixmap(QPixmap())
+            self.cam_label.setText("摄像头未开启")
+            self.cam_toggle_btn.setText("📷 开启摄像头")
+            self._cam_depth_running = False
+            self.cam_depth_label.setPixmap(QPixmap())
+            self.cam_depth_label.setText("深度图")
+            self.cam_depth_label.setStyleSheet(
+                "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
 
         # 重置状态栏和计时
         self._stop_timer()
