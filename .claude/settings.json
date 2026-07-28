@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(venv/Scripts/python.exe -m pip install --force-reinstall --no-deps cycler -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe -m pip install --ignore-installed cycler==0.12.1 -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe -c \"from cycler import Cycler; print\\('cycler OK'\\); import matplotlib; print\\('matplotlib OK'\\)\")",
+      "Bash(venv/Scripts/python.exe -m pip install --ignore-installed --force-reinstall python-dateutil matplotlib -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(D:/AI_Software/Python39/python.exe -m venv venv)",
+      "Bash(venv/Scripts/python.exe -m pip install torch numpy matplotlib safetensors einops pillow trimesh plyfile omegaconf numba pandas typer opencv-python imageio huggingface_hub scipy torchvision scikit-learn addict pyyaml pypose PySide6 gradio python-dateutil -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe -c \"from PySide6.QtWidgets import QApplication; import matplotlib; import torch; from PIL import Image; from cycler import Cycler; print\\('ALL OK'\\)\")",
+      "Bash(venv/Scripts/python.exe -m pip install moviepy pillow_heif -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "Bash(venv/Scripts/python.exe -m pip install \"moviepy==1.0.3\" -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(rm -rf test_debug/output)",
+      "Bash(venv/Scripts/python.exe da3_streaming/da3_streaming.py --image_dir test_debug/images --config da3_streaming/configs/base_config.yaml --output_dir test_debug/output)",
+      "Bash(OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 venv/Scripts/python.exe da3_streaming/da3_streaming.py --image_dir test_debug/images --config da3_streaming/configs/base_config.yaml --output_dir test_debug/output)",
+      "Bash(venv/Scripts/python.exe --version)",
+      "Bash(rm -rf test_debug/output*)",
+      "Bash(venv/Scripts/python.exe da3_streaming/npz_output_process.py --npz_folder test_debug/output/results_output --pose_file test_debug/output/camera_poses.txt --output_file test_debug/output/combined.ply --sample_ratio 1.0)",
+      "Bash(git restore *)",
+      "Bash(git commit -m 'fix: CPU/Windows兼容性修复 *)",
+      "Bash(venv/Scripts/python.exe -m pip install PySide6-WebEngine -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe -c \"from PySide6.QtWebEngineWidgets import QWebEngineView; print\\('OK'\\)\")",
+      "Bash(venv/Scripts/python.exe -m pip install \"gradio>=5,<6\" -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(git push *)",
+      "Bash(netstat -ano)",
+      "Bash(awk '{print $2}')",
+      "Bash(awk -F: '{print $NF}')",
+      "Bash(tasklist)"
+    ]
+  }
+}

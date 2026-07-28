@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QFrame, QSlider, QCheckBox, QComboBox, QLineEdit,
     QGridLayout, QScrollArea
 )
-from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer, QTime
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer, QTime, QRunnable, QThreadPool, QObject
 from PySide6.QtGui import QPixmap, QImage, QColor, QPalette
 
 import os, glob, shutil, socket, threading, time
@@ -17,42 +17,49 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 
 # ============================================================
-# 文件复制线程：复制图片并实时报告进度
+# 信号发射器（QRunnable 不能直接有信号，通过这个中转）
 # ============================================================
-class FileCopyWorker(QThread):
-    progress = Signal(int)    # 进度百分比
-    finished = Signal(str)    # 目标目录
+class UploadEmitter(QObject):
+    progress = Signal(int)
+    finished = Signal(str)
     error    = Signal(str)
 
-    def __init__(self, file_list, dest_dir):
+class DA3Emitter(QObject):
+    finished = Signal(str, str)
+    progress = Signal(str, int)
+    error   = Signal(str)
+
+# ============================================================
+# 文件复制任务（QRunnable，由线程池管理）
+# ============================================================
+class FileCopyRunnable(QRunnable):
+    def __init__(self, file_list, dest_dir, emitter):
         super().__init__()
         self.file_list = file_list
         self.dest_dir  = dest_dir
+        self.emitter   = emitter
 
     def run(self):
         try:
             total = len(self.file_list)
             for i, f in enumerate(self.file_list):
                 shutil.copy(f, os.path.join(self.dest_dir, os.path.basename(f)))
-                self.progress.emit(int((i + 1) / total * 100))
-                self.msleep(5)
-            self.finished.emit(self.dest_dir)
+                self.emitter.progress.emit(int((i + 1) / total * 100))
+                QThread.msleep(5)
+            self.emitter.finished.emit(self.dest_dir)
         except Exception as e:
-            self.error.emit(str(e))
+            self.emitter.error.emit(str(e))
 
 
 # ============================================================
-# 视频抽帧线程：用 cv2 读取视频，按帧率抽帧，实时报告进度
+# 视频抽帧任务（QRunnable，由线程池管理）
 # ============================================================
-class VideoFrameWorker(QThread):
-    progress = Signal(int)
-    finished = Signal(str)
-    error    = Signal(str)
-
-    def __init__(self, video_path, dest_dir, fps=2, max_width=640):
+class VideoFrameRunnable(QRunnable):
+    def __init__(self, video_path, dest_dir, emitter, fps=2, max_width=640):
         super().__init__()
         self.video_path = video_path
         self.dest_dir   = dest_dir
+        self.emitter    = emitter
         self.fps        = fps
         self.max_width  = max_width
 
@@ -61,98 +68,97 @@ class VideoFrameWorker(QThread):
             import cv2
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
-                self.error.emit(f"无法打开视频: {self.video_path}")
+                self.emitter.error.emit(f"无法打开视频: {self.video_path}")
                 return
-
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            video_fps    = cap.get(cv2.CAP_PROP_FPS) or 30
-            interval     = max(1, int(video_fps / self.fps))
-
+            video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            interval = max(1, int(video_fps / self.fps))
             saved = 0
-            idx = 0
-            while True:
+            for idx in range(total_frames):
                 ret, frame = cap.read()
-                if not ret:
-                    break
+                if not ret: break
                 if idx % interval == 0:
                     h, w = frame.shape[:2]
                     if w > self.max_width:
-                        scale = self.max_width / w
-                        frame = cv2.resize(frame, (self.max_width, int(h * scale)))
-                    out_path = os.path.join(
-                        self.dest_dir, f"frame_{saved:06d}.png")
-                    cv2.imwrite(out_path, frame)
+                        frame = cv2.resize(frame, (self.max_width, int(h * w / self.max_width if h else 1)))
+                    cv2.imwrite(os.path.join(self.dest_dir, f"frame_{saved:06d}.png"), frame)
                     saved += 1
-
-                idx += 1
-                if total_frames > 0:
-                    self.progress.emit(int(idx / total_frames * 100))
-                self.msleep(1)
-
+                self.emitter.progress.emit(int(idx / total_frames * 100))
+                QThread.msleep(1)
             cap.release()
-            self.progress.emit(100)
-            self.finished.emit(self.dest_dir)
-
+            self.emitter.progress.emit(100)
+            self.emitter.finished.emit(self.dest_dir)
         except Exception as e:
             import traceback
-            self.error.emit(f"{e}\n{traceback.format_exc()}")
+            self.emitter.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 # ============================================================
-# 摄像头深度计算线程（复用缓存模型，加速推理）
+# 持久摄像头深度计算线程（常驻，复用线程，避免频繁创建销毁）
 # ============================================================
-class CamDepthWorker(QThread):
-    finished = Signal(object)  # 传出 depth numpy array
+class PersistentCamWorker(QThread):
+    finished = Signal(object)
     error    = Signal(str)
 
-    def __init__(self, frame_bgr, cached_model):
+    def __init__(self, cached_model):
         super().__init__()
-        self.frame_bgr   = frame_bgr   # BGR numpy array
-        self.cached_model = cached_model  # 预加载的 DepthAnything3
+        self.cached_model = cached_model
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._latest_frame = None
+        self._running = True
+
+    def submit_frame(self, frame_bgr):
+        """主线程调用：提交最新帧（只保留最新一帧，旧帧丢弃）"""
+        with self._lock:
+            self._latest_frame = frame_bgr.copy()
+            self._cond.notify()
+
+    def stop(self):
+        """停止循环"""
+        with self._lock:
+            self._running = False
+            self._cond.notify()
 
     def run(self):
-        try:
-            import tempfile, cv2
-            # 保存帧为临时文件
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                cv2.imwrite(f.name, self.frame_bgr)
-                tmp_path = f.name
+        import tempfile, cv2
+        while True:
+            with self._lock:
+                while self._latest_frame is None and self._running:
+                    self._cond.wait()
+                if not self._running:
+                    break
+                frame = self._latest_frame
+                self._latest_frame = None
 
-            prediction = self.cached_model.inference([tmp_path])
-            os.unlink(tmp_path)
-
-            depth = np.squeeze(prediction.depth)
-            self.finished.emit(depth)
-        except Exception as e:
-            import traceback
-            self.error.emit(f"{e}\n{traceback.format_exc()}")
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    cv2.imwrite(f.name, frame)
+                    tmp_path = f.name
+                prediction = self.cached_model.inference([tmp_path])
+                os.unlink(tmp_path)
+                depth = np.squeeze(prediction.depth)
+                self.finished.emit(depth)
+            except Exception as e:
+                import traceback
+                self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 # ============================================================
 # 后台工作线程：DA3 推理
 # ============================================================
-class DA3Worker(QThread):
-    # ============================================================
-    # 定义完成、进度、错误信号
-    # ============================================================
-    finished = Signal(str, str)
-    progress = Signal(str, int)
-    error   = Signal(str)
-
-    # ============================================================
-    # 接收图片目录、输出目录、配置文件路径
-    # ============================================================    
-    def __init__(self, image_dir, output_dir, config_path, sample_ratio=1.0, model_cache=None):
+class DA3Runnable(QRunnable):
+    def __init__(self, image_dir, output_dir, config_path, emitter, sample_ratio=1.0):
         super().__init__()
         self.image_dir    = image_dir
         self.output_dir   = output_dir
         self.config_path  = config_path
+        self.emitter      = emitter
         self.sample_ratio = sample_ratio
-        self.model_cache  = model_cache  # 外部传入的预加载模型
 
     def _log(self, msg, pct):
-        self.progress.emit(msg, pct)
-        self.msleep(10)
+        self.emitter.progress.emit(msg, pct)
+        QThread.msleep(10)
 
     def run(self):
         try:
@@ -220,11 +226,11 @@ class DA3Worker(QThread):
 
             glb_files = sorted(glob.glob(os.path.join(self.output_dir, "*.glb")))
             glb_path = glb_files[-1] if glb_files else ""
-            self.finished.emit(self.output_dir, glb_path)
+            self.emitter.finished.emit(self.output_dir, glb_path)
 
         except Exception as e:
             import traceback
-            self.error.emit(f"{e}\n{traceback.format_exc()}")
+            self.emitter.error.emit(f"{e}\n{traceback.format_exc()}"
 
 
 # ============================================================
@@ -939,6 +945,10 @@ class GradioLikeApp(QMainWindow):
             self._cam_cap.release()
             self._cam_cap = None
             self._cam_depth_running = False
+            if hasattr(self, '_cam_persistent_worker') and self._cam_persistent_worker:
+                self._cam_persistent_worker.stop()
+                self._cam_persistent_worker.wait()
+                self._cam_persistent_worker = None
             self.cam_label.setPixmap(QPixmap())
             self.cam_label.setText("摄像头未开启")
             self.cam_label.setStyleSheet(
@@ -954,6 +964,12 @@ class GradioLikeApp(QMainWindow):
             self.cam_label.setText("")
             self.cam_label.setStyleSheet("background-color: #000; border-radius: 8px;")
             self.cam_toggle_btn.setText("⏹ 关闭摄像头")
+            # 启动持久深度计算线程（只创建一次）
+            if self._cached_model:
+                self._cam_persistent_worker = PersistentCamWorker(self._cached_model)
+                self._cam_persistent_worker.finished.connect(self._on_cam_depth_finished)
+                self._cam_persistent_worker.error.connect(self._on_cam_depth_error)
+                self._cam_persistent_worker.start()
             self._cam_timer.start(30)
 
     def _on_cam_frame(self):
@@ -971,16 +987,11 @@ class GradioLikeApp(QMainWindow):
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.cam_label.setPixmap(pix)
 
-        # 自动触发深度计算（复用缓存模型，不再创建临时目录）
-        if not self._cam_depth_running and self._cached_model is not None:
-            self._cam_depth_running = True
-            self._cam_depth_worker = CamDepthWorker(frame, self._cached_model)
-            self._cam_depth_worker.finished.connect(self._on_cam_depth_finished)
-            self._cam_depth_worker.error.connect(self._on_cam_depth_error)
-            self._cam_depth_worker.start()
+        # 提交帧给持久线程（自动丢弃旧帧，避免积压）
+        if hasattr(self, '_cam_persistent_worker') and self._cam_persistent_worker:
+            self._cam_persistent_worker.submit_frame(frame)
 
     def _on_cam_depth_finished(self, depth):
-        self._cam_depth_running = False
         from depth_anything_3.utils.visualize import visualize_depth
         d_vis = visualize_depth(depth)
         h, w, _ = d_vis.shape
@@ -1063,19 +1074,22 @@ class GradioLikeApp(QMainWindow):
         video_exts = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"}
         is_video = any(os.path.splitext(p)[1].lower() in video_exts for p in paths)
 
+        self._upload_emitter = UploadEmitter()
+        self._upload_emitter.progress.connect(self._on_upload_progress)
+        self._upload_emitter.finished.connect(self._on_upload_finished)
+        self._upload_emitter.error.connect(self._on_upload_error)
+
         if is_video and len(paths) == 1:
             self.status_label.setText("⏳ 正在抽帧...")
             fps = self.fps_slider.value() / 10.0
-            self._copy_worker = VideoFrameWorker(
-                paths[0], self.pending_image_dir, fps=fps, max_width=640)
+            runnable = VideoFrameRunnable(
+                paths[0], self.pending_image_dir, self._upload_emitter, fps=fps)
         else:
             self.status_label.setText("⏳ 正在上传...")
-            self._copy_worker = FileCopyWorker(paths, self.pending_image_dir)
+            runnable = FileCopyRunnable(
+                paths, self.pending_image_dir, self._upload_emitter)
 
-        self._copy_worker.progress.connect(self._on_upload_progress)
-        self._copy_worker.finished.connect(self._on_upload_finished)
-        self._copy_worker.error.connect(self._on_upload_error)
-        self._copy_worker.start()
+        QThreadPool.globalInstance().start(runnable)
 
     def _on_upload_progress(self, pct):
         self.upload_bar.setValue(pct)
@@ -1115,17 +1129,16 @@ class GradioLikeApp(QMainWindow):
         self._start_timer()
 
         work_dir = os.path.dirname(self.pending_image_dir)
-        sample_ratio = self.slider.value() / 100.0  # 0-100 → 0.0-1.0
-        self._worker = DA3Worker(
+        sample_ratio = self.slider.value() / 100.0
+        self._da3_emitter = DA3Emitter()
+        self._da3_emitter.progress.connect(self._on_progress)
+        self._da3_emitter.finished.connect(self._on_da3_finished)
+        self._da3_emitter.error.connect(self._on_da3_error)
+        runnable = DA3Runnable(
             self.pending_image_dir, work_dir,
             "da3_streaming/configs/base_config.yaml",
-            sample_ratio=sample_ratio,
-            model_cache=getattr(self, '_cached_model', None),
-        )
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_da3_finished)
-        self._worker.error.connect(self._on_da3_error)
-        self._worker.start()
+            self._da3_emitter, sample_ratio=sample_ratio)
+        QThreadPool.globalInstance().start(runnable)
 
     def _on_da3_finished(self, output_dir, glb_path):
         self._stop_timer()
@@ -1162,13 +1175,9 @@ class GradioLikeApp(QMainWindow):
     # 清空全部，恢复初始状态
     # ============================================================
     def _on_clear_all(self):
-        # 停止后台线程
-        if hasattr(self, '_worker') and self._worker.isRunning():
-            self._worker.terminate()
-            self._worker.wait()
-        if hasattr(self, '_copy_worker') and self._copy_worker.isRunning():
-            self._copy_worker.terminate()
-            self._copy_worker.wait()
+        # 等待线程池中的任务完成（已提交的不可取消）
+        QThreadPool.globalInstance().clear()
+        QThreadPool.globalInstance().waitForDone()
 
         # 关闭 HTTP 服务器
         if self._http_server:
@@ -1227,7 +1236,10 @@ class GradioLikeApp(QMainWindow):
             self.cam_label.setPixmap(QPixmap())
             self.cam_label.setText("摄像头未开启")
             self.cam_toggle_btn.setText("📷 开启摄像头")
-            self._cam_depth_running = False
+            if hasattr(self, '_cam_persistent_worker') and self._cam_persistent_worker:
+                self._cam_persistent_worker.stop()
+                self._cam_persistent_worker.wait()
+                self._cam_persistent_worker = None
             self.cam_depth_label.setPixmap(QPixmap())
             self.cam_depth_label.setText("深度图")
             self.cam_depth_label.setStyleSheet(
