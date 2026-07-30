@@ -145,7 +145,112 @@ class PersistentCamWorker(QThread):
 
 
 # ============================================================
-# 后台工作线程：DA3 推理
+# RANSAC 地面平面检测 + 坐标轴，合并到 GLB
+# ============================================================
+def _add_ground_plane(ply_path):
+    """对点云做 RANSAC 平面拟合，生成地面面片+坐标轴，合并到 GLB"""
+    from sklearn.linear_model import RANSACRegressor
+
+    # 1. 加载点云
+    scene = trimesh.load(ply_path)
+    # 点云可能是 PointCloud 或 Trimesh，统一获取顶点
+    if isinstance(scene, trimesh.Trimesh):
+        pts = np.asarray(scene.vertices)
+        if hasattr(scene.visual, 'vertex_colors'):
+            colors = np.asarray(scene.visual.vertex_colors)[:, :3]
+        else:
+            colors = None
+    elif isinstance(scene, trimesh.PointCloud):
+        pts = np.asarray(scene.vertices)
+        colors = np.asarray(scene.colors)[:, :3] if hasattr(scene, 'colors') and scene.colors is not None else None
+    else:
+        return
+
+    # 采样点云用于显示（最多 200k 点）
+    if len(pts) > 200000:
+        idx_show = np.random.choice(len(pts), 200000, replace=False)
+        pc_pts = pts[idx_show]
+        pc_col = colors[idx_show] if colors is not None and len(colors) == len(pts) else None
+    else:
+        pc_pts = pts
+        pc_col = colors
+
+    # 点云用 trimesh.PointCloud 保留
+    pc_mesh = trimesh.PointCloud(vertices=pc_pts)
+    if pc_col is not None and len(pc_col) == len(pc_pts):
+        pc_mesh.colors = pc_col
+
+    n = min(50000, len(pts))
+    idx = np.random.choice(len(pts), n, replace=False)
+    sample = pts[idx]
+
+    # 2. RANSAC 找最大平面（地面）
+    ransac = RANSACRegressor(residual_threshold=0.05, max_trials=200)
+    ransac.fit(sample[:, :2], sample[:, 2])
+    inliers = ransac.inlier_mask_
+
+    if inliers.sum() < 100:
+        # 找不到平面 → 退化为场景中心坐标轴
+        cx, cy, cz = pts.mean(axis=0)
+        axis_len = np.ptp(pts, axis=0).max() * 0.3
+        a = b = c = 0
+    else:
+        a, b = ransac.estimator_.coef_
+        c = ransac.estimator_.intercept_
+        ground_pts = sample[inliers]
+        x_min, x_max = ground_pts[:, 0].min(), ground_pts[:, 0].max()
+        y_min, y_max = ground_pts[:, 1].min(), ground_pts[:, 1].max()
+        margin = 0.1 * max(x_max - x_min, y_max - y_min)
+        x_min -= margin; x_max += margin
+        y_min -= margin; y_max += margin
+        axis_len = max(x_max - x_min, y_max - y_min) * 0.4
+        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+        cz = a * cx + b * cy + c
+
+        # 3. 生成地面矩形网格
+        xs = np.linspace(x_min, x_max, 20)
+        ys = np.linspace(y_min, y_max, 20)
+        X, Y = np.meshgrid(xs, ys)
+        Z = a * X + b * Y + c
+        plane_verts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+        plane_faces = []
+        for i in range(19):
+            for j in range(19):
+                v00 = i * 20 + j
+                # 三角形 1: v00, v00+1, v00+20
+                plane_faces.append([v00, v00 + 1, v00 + 20])
+                # 三角形 2: v00+1, v00+21, v00+20
+                plane_faces.append([v00 + 1, v00 + 21, v00 + 20])
+        plane_mesh = trimesh.Trimesh(vertices=plane_verts, faces=plane_faces)
+        plane_mesh.visual.vertex_colors = [80, 200, 80, 200]
+
+    # 4. 坐标轴
+    origin = np.array([cx, cy, cz])
+    colors_axis = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    axes_meshes = []
+    directions = [[axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]]
+    for i, (d, col) in enumerate(zip(directions, colors_axis)):
+        seg = trimesh.creation.cylinder(radius=axis_len * 0.02, height=axis_len, sections=8)
+        if i == 0:
+            seg.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [0, 1, 0]))
+        elif i == 1:
+            seg.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        seg.apply_translation(origin + np.array(d) * 0.5)
+        seg.visual.vertex_colors = col
+        axes_meshes.append(seg)
+
+    # 5. 用 trimesh.Scene 包装所有几何体，导出 GLB
+    glb_path = os.path.splitext(ply_path)[0] + ".glb"
+    export_scene = trimesh.Scene()
+    export_scene.add_geometry(pc_mesh, node_name="pointcloud")
+    export_scene.add_geometry(plane_mesh, node_name="ground")
+    for i, ax in enumerate(axes_meshes):
+        export_scene.add_geometry(ax, node_name=f"axis_{i}")
+    export_scene.export(glb_path)
+
+
+# ============================================================
+# 后台工作线程（线程池 QRunnable）
 # ============================================================
 class DA3Runnable(QRunnable):
     def __init__(self, image_dir, output_dir, config_path, emitter, sample_ratio=1.0):
@@ -224,13 +329,22 @@ class DA3Runnable(QRunnable):
             else:
                 self._log("完成（无融合文件）", 95)
 
+            # === RANSAC 地面检测 + 坐标轴（增强3D显示） ===
+            ply_file = os.path.join(self.output_dir, "combined.ply")
+            if os.path.exists(ply_file):
+                try:
+                    self._log("RANSAC 检测地面...", 97)
+                    _add_ground_plane(ply_file)
+                except Exception:
+                    pass
+
             glb_files = sorted(glob.glob(os.path.join(self.output_dir, "*.glb")))
             glb_path = glb_files[-1] if glb_files else ""
             self.emitter.finished.emit(self.output_dir, glb_path)
 
         except Exception as e:
             import traceback
-            self.emitter.error.emit(f"{e}\n{traceback.format_exc()}"
+            self.emitter.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 # ============================================================
