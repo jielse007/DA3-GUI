@@ -30,7 +30,8 @@
       "Bash(awk -F: '{print $NF}')",
       "Bash(tasklist)",
       "Bash(venv/Scripts/python.exe -m pip install open3d -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
-      "Bash(D:/AI_Software/Python39/python.exe -m pip install open3d -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)"
+      "Bash(D:/AI_Software/Python39/python.exe -m pip install open3d -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe da3_streaming/patch_open3d.py)"
     ]
   }
 }

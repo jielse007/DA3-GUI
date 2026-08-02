@@ -13,7 +13,6 @@ import os, glob, shutil, socket, threading, time
 import numpy as np
 import trimesh
 from datetime import datetime
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 
 # ============================================================
@@ -147,111 +146,74 @@ class PersistentCamWorker(QThread):
 # ============================================================
 # RANSAC 地面平面检测 + 坐标轴，合并到 GLB
 # ============================================================
-def _add_ground_plane(ply_path):
-    """对点云做 RANSAC 平面拟合，生成地面面片+坐标轴，合并到 GLB"""
-    from sklearn.linear_model import RANSACRegressor
-
-    # 1. 加载点云
-    scene = trimesh.load(ply_path)
-    # 点云可能是 PointCloud 或 Trimesh，统一获取顶点
-    if isinstance(scene, trimesh.Trimesh):
-        pts = np.asarray(scene.vertices)
-        if hasattr(scene.visual, 'vertex_colors'):
-            colors = np.asarray(scene.visual.vertex_colors)[:, :3]
-        else:
-            colors = None
-    elif isinstance(scene, trimesh.PointCloud):
-        pts = np.asarray(scene.vertices)
-        colors = np.asarray(scene.colors)[:, :3] if hasattr(scene, 'colors') and scene.colors is not None else None
-    else:
-        return
-
-    # 采样点云用于显示（最多 200k 点）
-    if len(pts) > 200000:
-        idx_show = np.random.choice(len(pts), 200000, replace=False)
-        pc_pts = pts[idx_show]
-        pc_col = colors[idx_show] if colors is not None and len(colors) == len(pts) else None
-    else:
-        pc_pts = pts
-        pc_col = colors
-
-    # 点云用 trimesh.PointCloud 保留
-    pc_mesh = trimesh.PointCloud(vertices=pc_pts)
-    if pc_col is not None and len(pc_col) == len(pc_pts):
-        pc_mesh.colors = pc_col
-
-    n = min(50000, len(pts))
-    idx = np.random.choice(len(pts), n, replace=False)
-    sample = pts[idx]
-
-    # 2. RANSAC 找最大平面（地面）
-    ransac = RANSACRegressor(residual_threshold=0.05, max_trials=200)
-    ransac.fit(sample[:, :2], sample[:, 2])
-    inliers = ransac.inlier_mask_
-
-    if inliers.sum() < 100:
-        # 找不到平面 → 退化为场景中心坐标轴
-        cx, cy, cz = pts.mean(axis=0)
-        axis_len = np.ptp(pts, axis=0).max() * 0.3
-        a = b = c = 0
-    else:
-        a, b = ransac.estimator_.coef_
-        c = ransac.estimator_.intercept_
-        ground_pts = sample[inliers]
-        x_min, x_max = ground_pts[:, 0].min(), ground_pts[:, 0].max()
-        y_min, y_max = ground_pts[:, 1].min(), ground_pts[:, 1].max()
-        margin = 0.1 * max(x_max - x_min, y_max - y_min)
-        x_min -= margin; x_max += margin
-        y_min -= margin; y_max += margin
-        axis_len = max(x_max - x_min, y_max - y_min) * 0.4
-        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
-        cz = a * cx + b * cy + c
-
-        # 3. 生成地面矩形网格
-        xs = np.linspace(x_min, x_max, 20)
-        ys = np.linspace(y_min, y_max, 20)
-        X, Y = np.meshgrid(xs, ys)
-        Z = a * X + b * Y + c
-        plane_verts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-        plane_faces = []
-        for i in range(19):
-            for j in range(19):
-                v00 = i * 20 + j
-                # 三角形 1: v00, v00+1, v00+20
-                plane_faces.append([v00, v00 + 1, v00 + 20])
-                # 三角形 2: v00+1, v00+21, v00+20
-                plane_faces.append([v00 + 1, v00 + 21, v00 + 20])
-        plane_mesh = trimesh.Trimesh(vertices=plane_verts, faces=plane_faces)
-        plane_mesh.visual.vertex_colors = [80, 200, 80, 200]
-
-    # 4. 坐标轴
-    origin = np.array([cx, cy, cz])
-    colors_axis = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
-    axes_meshes = []
-    directions = [[axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]]
-    for i, (d, col) in enumerate(zip(directions, colors_axis)):
-        seg = trimesh.creation.cylinder(radius=axis_len * 0.02, height=axis_len, sections=8)
-        if i == 0:
-            seg.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [0, 1, 0]))
-        elif i == 1:
-            seg.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
-        seg.apply_translation(origin + np.array(d) * 0.5)
-        seg.visual.vertex_colors = col
-        axes_meshes.append(seg)
-
-    # 5. 用 trimesh.Scene 包装所有几何体，导出 GLB
-    glb_path = os.path.splitext(ply_path)[0] + ".glb"
-    export_scene = trimesh.Scene()
-    export_scene.add_geometry(pc_mesh, node_name="pointcloud")
-    export_scene.add_geometry(plane_mesh, node_name="ground")
-    for i, ax in enumerate(axes_meshes):
-        export_scene.add_geometry(ax, node_name=f"axis_{i}")
-    export_scene.export(glb_path)
-
-
+# Open3D 查看器线程（RANSAC 地面检测 + 坐标轴）
 # ============================================================
-# 后台工作线程（线程池 QRunnable）
-# ============================================================
+class Open3DViewer(QThread):
+    hwnd_ready = Signal(int)  # 窗口创建完成后发送 HWND 给主线程嵌入
+
+    def __init__(self, ply_path):
+        super().__init__()
+        self.ply_path = ply_path
+
+    def run(self):
+        import open3d as o3d
+
+        pcd = o3d.io.read_point_cloud(self.ply_path)
+        if not pcd.has_points():
+            return
+        pcd = pcd.voxel_down_sample(voxel_size=0.01)
+
+        plane_model, inliers = pcd.segment_plane(
+            distance_threshold=0.05, ransac_n=3, num_iterations=500)
+        a, b, c_pl, d = plane_model
+        inlier_cloud = pcd.select_by_index(inliers)
+        bbox = inlier_cloud.get_axis_aligned_bounding_box()
+        ext = bbox.get_extent()
+
+        plane_mesh = o3d.geometry.TriangleMesh.create_box(
+            ext[0] * 1.1, 0.01, ext[2] * 1.1)
+        plane_mesh.translate(bbox.get_center() - [0, ext[1] / 2, 0])
+        plane_mesh.paint_uniform_color([0.2, 0.7, 0.2])
+
+        axes = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=ext.max() * 0.3, origin=bbox.get_center())
+
+        viewer = o3d.visualization.Visualizer()
+        viewer.create_window(
+            window_name="DA3-Open3D  [ L:Rotate  R:Pan  Scroll:Zoom ]",
+            width=800, height=600, visible=True)
+
+        viewer.add_geometry(pcd)
+        viewer.add_geometry(plane_mesh)
+        viewer.add_geometry(axes)
+
+        opt = viewer.get_render_option()
+        opt.point_size = 2.0
+        opt.background_color = np.array([0.15, 0.15, 0.18])
+        opt.show_coordinate_frame = False
+
+        # 用 Win32 API 找到窗口句柄（枚举窗口，匹配标题前缀）
+        import ctypes
+        user32 = ctypes.windll.user32
+        time.sleep(0.3)
+
+        found = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def enum_cb(h, l):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, buf, 256)
+            if buf.value.startswith("DA3-Open3D"):
+                found.append(h)
+                return False
+            return True
+        user32.EnumWindows(WNDENUMPROC(enum_cb), ctypes.c_void_p())
+
+        if found:
+            self.hwnd_ready.emit(found[0])
+        viewer.run()
+        viewer.destroy_window()
+
+
 class DA3Runnable(QRunnable):
     def __init__(self, image_dir, output_dir, config_path, emitter, sample_ratio=1.0):
         super().__init__()
@@ -334,7 +296,7 @@ class DA3Runnable(QRunnable):
             if os.path.exists(ply_file):
                 try:
                     self._log("RANSAC 检测地面...", 97)
-                    _add_ground_plane(ply_file)
+                    _open_in_open3d(os.path.join(self.output_dir, 'combined.ply'))
                 except Exception:
                     pass
 
@@ -479,7 +441,7 @@ class GradioLikeApp(QMainWindow):
         main_layout.setSpacing(10)                          # 设置布局内控件间距为10px
         main_layout.setContentsMargins(10, 10, 10, 10)      # 设置布局外边距：左10上10右10下10
 
-        self.create_header(main_layout)                     # 调用create_header方法创建头部区域并添加到主布局
+        # self.create_header(main_layout)                     # 调用create_header方法创建头部区域并添加到主布局
 
         splitter = QSplitter(Qt.Horizontal)                 # 创建水平分割器(可拖拽调整左右比例)
         splitter.addWidget(self.create_left_panel())        # 添加左侧面板(调用create_left_panel方法)
@@ -750,153 +712,65 @@ class GradioLikeApp(QMainWindow):
         t = QWidget()
         l = QVBoxLayout(t)
         l.setContentsMargins(0, 0, 0, 0)
-
-        from PySide6.QtWebEngineWidgets import QWebEngineView
-        self.pointcloud_viewer = QWebEngineView()
-        self.pointcloud_viewer.setMinimumHeight(450)
-        # 初始显示占位页面
-        self.pointcloud_viewer.setHtml("""
-            <html><body style="background:#1a1a2e;display:flex;align-items:center;
-            justify-content:center;height:100vh;margin:0;font-family:sans-serif">
-            <div style="text-align:center;color:#e0e0e0">
-            <div style="font-size:48px;margin-bottom:16px">&#127758;</div>
-            <div style="font-size:16px">3D点云查看器</div>
-            <div style="font-size:12px;color:#888;margin-top:8px">上传图片并运行推理后显示</div>
-            </div></body></html>
-        """)
-        l.addWidget(self.pointcloud_viewer)
-        self._http_server = None
-        self._http_port = None
+        self.pointcloud_container = QWidget()
+        self.pointcloud_container.setMinimumHeight(450)
+        self.pointcloud_container.setStyleSheet("background-color: #1a1a2e; border-radius: 8px;")
+        cl = QVBoxLayout(self.pointcloud_container)
+        cl.setContentsMargins(0, 0, 0, 0)
+        self.pointcloud_label = QLabel("Open3D Viewer\n\nUpload images and run inference to open")
+        self.pointcloud_label.setAlignment(Qt.AlignCenter)
+        self.pointcloud_label.setWordWrap(True)
+        self.pointcloud_label.setStyleSheet("color: #e0e0e0; font-size: 16px; padding: 20px; background: transparent;")
+        cl.addWidget(self.pointcloud_label)
+        l.addWidget(self.pointcloud_container)
+        self._embedded_hwnd = None
         return t
 
-    def _start_http_server(self, serve_dir):
-        """启动本地 HTTP 服务器（每次关闭旧服务，确保指向新目录）"""
-        # 关闭旧的 HTTP 服务
-        if self._http_server:
-            self._http_server.shutdown()
-            self._http_server = None
-            self._http_port = None
+    def _open_in_open3d(self, ply_path):
+        self.pointcloud_label.setText("Loading Open3D...\n\n" + os.path.basename(ply_path))
+        # 先关闭旧的嵌入窗口
+        self._close_embedded_o3d()
+        self._o3d_viewer = Open3DViewer(ply_path)
+        self._o3d_viewer.hwnd_ready.connect(self._embed_o3d_window)
+        self._o3d_viewer.start()
 
-        # 找空闲端口
-        for port in range(8765, 8790):
+    def _embed_o3d_window(self, hwnd):
+        """将 Open3D 窗口嵌入到 pointcloud_container"""
+        import ctypes
+        user32 = ctypes.windll.user32
+        container_id = int(self.pointcloud_container.winId())
+        user32.SetParent(hwnd, container_id)
+        # 去掉标题栏和边框
+        GWL_STYLE = -16
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~(0x00C00000 | 0x00080000 | 0x00040000)  # WS_CAPTION | WS_BORDER | WS_SIZEBOX
+        user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+        self._embedded_hwnd = hwnd
+        self.pointcloud_label.hide()
+        self._resize_embedded_o3d()
+
+    def _resize_embedded_o3d(self):
+        """调整嵌入窗口大小"""
+        if self._embedded_hwnd:
+            import ctypes
+            rect = self.pointcloud_container.rect()
+            ctypes.windll.user32.SetWindowPos(
+                self._embedded_hwnd, 0, 0, 0, rect.width(), rect.height(), 0x0040)
+
+    def _close_embedded_o3d(self):
+        """关闭嵌入的 Open3D 窗口"""
+        if self._embedded_hwnd:
+            import ctypes
             try:
-                s = socket.socket()
-                s.bind(('', port))
-                s.close()
-                self._http_port = port
-                break
-            except OSError:
-                continue
+                ctypes.windll.user32.DestroyWindow(self._embedded_hwnd)
+            except Exception:
+                pass
+            self._embedded_hwnd = None
+            self.pointcloud_label.show()
 
-        if not self._http_port:
-            return None
-
-        class CORSHandler(SimpleHTTPRequestHandler):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, directory=serve_dir, **kwargs)
-            def end_headers(self):
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "*")
-                super().end_headers()
-
-        self._http_server = HTTPServer(('127.0.0.1', self._http_port), CORSHandler)
-        t = threading.Thread(target=self._http_server.serve_forever, daemon=True)
-        t.start()
-        return self._http_port
-
-    def _load_glb_in_viewer(self, glb_path):
-        """在嵌入的 Babylon.js 查看器中加载 GLB 文件"""
-        glb_dir = os.path.dirname(os.path.abspath(glb_path))
-        glb_name = os.path.basename(glb_path)
-
-        port = self._start_http_server(glb_dir)
-        if not port:
-            self.pointcloud_viewer.setHtml(
-                "<h3 style='color:red;text-align:center;margin-top:100px'>"
-                "无法启动 HTTP 服务器</h3>")
-            return
-
-        glb_url = f"http://127.0.0.1:{port}/{glb_name}"
-
-        self.pointcloud_viewer.setHtml(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>3D Viewer</title>
-    <style>
-        /* 全局样式：无内外边距，隐藏溢出，全屏高度，深色背景 */
-        html, body {{ margin:0; padding:0; overflow:hidden; height:100%; background:#222; }}
-        #canvas {{ width:100%; height:100%; outline:none; }}
-        #loading {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
-              color:#ccc; font-family:sans-serif; font-size:14px; }}
-    </style>
-</head>
-<body>
-    <canvas id="canvas"></canvas>
-    <div id="loading">Loading...</div>
-    <!-- ========== 加载 Babylon.js 库 ========== -->
-    <script src="https://cdn.babylonjs.com/babylon.js"></script>
-    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
-    <script>
-        const canvas = document.getElementById("canvas");
-        const engine = new BABYLON.Engine(canvas, true, {{ preserveDrawingBuffer: true, stencil: true, antialias: true }});
-        const scene = new BABYLON.Scene(engine);
-        scene.clearColor = new BABYLON.Color4(0.15, 0.15, 0.18, 1);
-
-        // === 灯光 (Sandbox 同款) ===
-        const light = new BABYLON.HemisphericLight("light",
-            new BABYLON.Vector3(0, 1, 0), scene);
-        light.intensity = 0.7;
-
-        // === 相机（正视图角度，距离适中） ===
-        const camera = new BABYLON.ArcRotateCamera(
-            "cam",
-            Math.PI/2,          // alpha: 水平旋转角度90度
-            Math.PI/2.2,        // beta:  垂直旋转角度82度
-            5,                  // 初始半径（加载后自动适配）
-            BABYLON.Vector3.Zero(), scene);
-        camera.attachControl(canvas, true);
-        camera.lowerRadiusLimit = 0.0001;
-        camera.upperRadiusLimit = 10000;
-        camera.minZ = 0.0001;
-        camera.wheelPrecision = 50;       // 滚轮缩放（越大缩放越慢（更精确））
-        camera.angularSensibilityX = 1000;
-        camera.angularSensibilityY = 1000;
-        camera.panningSensibility = 1000;
-
-        BABYLON.SceneLoader.ImportMesh(
-            "",
-            "",
-            "{glb_url}",
-            scene,
-
-            function(meshes) {{
-                document.getElementById("loading").style.display = "none";
-                if (meshes.length > 0) {{
-                    const bb = meshes[0].getBoundingInfo().boundingBox;
-                    const center = bb.center;
-                    const size = bb.extendSize.length();
-                    camera.target = center;
-                    camera.radius = Math.max(size * 0.5, 0.1);
-                    camera.lowerRadiusLimit = size * 0.00001;
-                }}
-            }},
-            function(evt) {{
-                if (evt.lengthComputable) {{
-                    document.getElementById("loading").textContent =
-                        "Loading " + Math.round(evt.loaded*100/evt.total) + "%";
-                }}
-            }},
-            function() {{ document.getElementById("loading").textContent = "Load Failed"; }}
-        );
-
-        engine.runRenderLoop(() => scene.render());
-        window.addEventListener("resize", () => engine.resize());
-    </script>
-</body>
-</html>""")
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_embedded_o3d()
 
     def _tab_depth(self):
         t = QWidget()
@@ -1271,7 +1145,7 @@ class GradioLikeApp(QMainWindow):
 
         if glb_path and os.path.exists(glb_path):
             self.progress_label.setText(f"状态: 加载 3D 模型中 ({os.path.basename(glb_path)})")
-            self._load_glb_in_viewer(glb_path)
+            self._open_in_open3d(os.path.join(output_dir, "combined.ply"))
         else:
             self.progress_label.setText("状态: 完成（无 GLB 文件）")
 
@@ -1293,12 +1167,6 @@ class GradioLikeApp(QMainWindow):
         QThreadPool.globalInstance().clear()
         QThreadPool.globalInstance().waitForDone()
 
-        # 关闭 HTTP 服务器
-        if self._http_server:
-            self._http_server.shutdown()
-            self._http_server = None
-            self._http_port = None
-
         # 重置上传进度
         self.upload_bar.setValue(0)
         self.upload_progress_label.setText("上传: 等待")
@@ -1319,15 +1187,9 @@ class GradioLikeApp(QMainWindow):
             del self.pending_image_dir
 
         # 重置 3D 点云查看器
-        self.pointcloud_viewer.setHtml("""
-            <html><body style="background:#1a1a2e;display:flex;align-items:center;
-            justify-content:center;height:100vh;margin:0;font-family:sans-serif">
-            <div style="text-align:center;color:#e0e0e0">
-            <div style="font-size:48px;margin-bottom:16px">&#127758;</div>
-            <div style="font-size:16px">3D点云查看器</div>
-            <div style="font-size:12px;color:#888;margin-top:8px">上传图片并运行推理后显示</div>
-            </div></body></html>
-        """)
+        self._close_embedded_o3d()
+        self.pointcloud_label.show()
+        self.pointcloud_label.setText("Open3D Viewer\n\nUpload images and run inference to open")
 
         # 重置深度图查看器
         self.rgb_label.setPixmap(QPixmap())
