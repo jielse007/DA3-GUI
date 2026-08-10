@@ -30,7 +30,14 @@
       "Bash(awk -F: '{print $NF}')",
       "Bash(tasklist)",
       "Bash(venv/Scripts/python.exe -m pip install open3d -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
-      "Bash(D:/AI_Software/Python39/python.exe -m pip install open3d -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)"
+      "Bash(D:/AI_Software/Python39/python.exe -m pip install open3d -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)",
+      "Bash(venv/Scripts/python.exe -c \"import py_compile; py_compile.compile\\('da3_streaming/my_example.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(mkdir -p da3_streaming/babylon_assets)",
+      "Bash(curl -sL --connect-timeout 15 \"https://cdn.jsdelivr.net/npm/babylonjs@6.49.0/babylon.js\" -o da3_streaming/babylon_assets/babylon.js)",
+      "Bash(sed -i '1224s/.*/            f.write\\(\"1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1\\\\\\\\n\"\\)/' da3_streaming/my_example.py)",
+      "Bash(sed -i '/^\"\\)$/d' da3_streaming/my_example.py)",
+      "Bash(venv/Scripts/python.exe _fix_line.py)",
+      "Bash(rm _fix_line.py)"
     ]
   }
 }

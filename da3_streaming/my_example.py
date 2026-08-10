@@ -109,13 +109,11 @@ class PersistentCamWorker(QThread):
         self._running = True
 
     def submit_frame(self, frame_bgr):
-        """主线程调用：提交最新帧（只保留最新一帧，旧帧丢弃）"""
         with self._lock:
             self._latest_frame = frame_bgr.copy()
             self._cond.notify()
 
     def stop(self):
-        """停止循环"""
         with self._lock:
             self._running = False
             self._cond.notify()
@@ -142,6 +140,25 @@ class PersistentCamWorker(QThread):
             except Exception as e:
                 import traceback
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+
+# ============================================================
+# 深度图 → 3D 点云（用于摄像头实时保存）
+# ============================================================
+def _depth_to_points(frame_bgr, depth, fx=500, fy=500):
+    """将深度图转为 3D 点云（相机坐标系）"""
+    h, w = depth.shape
+    cx, cy = w / 2, h / 2
+    u = np.arange(w)
+    v = np.arange(h)
+    uu, vv = np.meshgrid(u, v)
+    z = depth
+    x = (uu - cx) * z / fx
+    y = (vv - cy) * z / fy
+    pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    # 滤除无效点
+    valid = (z.reshape(-1) > 0.01)
+    return pts[valid]
 
 
 # ============================================================
@@ -185,7 +202,7 @@ def _add_ground_plane(ply_path):
     sample = pts[idx]
 
     # 2. RANSAC 找最大平面（地面）
-    ransac = RANSACRegressor(residual_threshold=0.05, max_trials=200)
+    ransac = RANSACRegressor(residual_threshold=0.05, max_trials=500)
     ransac.fit(sample[:, :2], sample[:, 2])
     inliers = ransac.inlier_mask_
 
@@ -203,7 +220,7 @@ def _add_ground_plane(ply_path):
         margin = 0.1 * max(x_max - x_min, y_max - y_min)
         x_min -= margin; x_max += margin
         y_min -= margin; y_max += margin
-        axis_len = max(x_max - x_min, y_max - y_min) * 0.4
+        axis_len = max(x_max - x_min, y_max - y_min) * 0.2
         cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
         cz = a * cx + b * cy + c
 
@@ -222,7 +239,7 @@ def _add_ground_plane(ply_path):
                 # 三角形 2: v00+1, v00+21, v00+20
                 plane_faces.append([v00 + 1, v00 + 21, v00 + 20])
         plane_mesh = trimesh.Trimesh(vertices=plane_verts, faces=plane_faces)
-        plane_mesh.visual.vertex_colors = [80, 200, 80, 200]
+        plane_mesh.visual.vertex_colors = [80, 200, 80, 50]
 
     # 4. 坐标轴
     origin = np.array([cx, cy, cz])
@@ -300,9 +317,17 @@ class DA3Runnable(QRunnable):
             sys.stdout = io.StringIO()
 
             self._log("DA3 推理中...", 30)
-            da3.run()               # 执行DA3推理（主要耗时操作）
-            da3.close()             # 关闭DA3实例，释放资源
-            sys.stdout = old_stdout # 恢复标准输出
+            try:
+                da3.run()
+            finally:
+                da3.close()
+                sys.stdout = old_stdout
+                # 手动清理临时目录（防止 da3.close 未覆盖的情况）
+                import shutil as _shutil
+                for _d in ["_tmp_results_unaligned", "_tmp_results_aligned", "_tmp_results_loop"]:
+                    _p = os.path.join(self.output_dir, _d)
+                    if os.path.exists(_p):
+                        _shutil.rmtree(_p, ignore_errors=True)
 
             self._log("融合点云并导出 GLB...", 80)
 
@@ -479,7 +504,7 @@ class GradioLikeApp(QMainWindow):
         main_layout.setSpacing(10)                          # 设置布局内控件间距为10px
         main_layout.setContentsMargins(10, 10, 10, 10)      # 设置布局外边距：左10上10右10下10
 
-        self.create_header(main_layout)                     # 调用create_header方法创建头部区域并添加到主布局
+        # self.create_header(main_layout)                     # 调用create_header方法创建头部区域并添加到主布局
 
         splitter = QSplitter(Qt.Horizontal)                 # 创建水平分割器(可拖拽调整左右比例)
         splitter.addWidget(self.create_left_panel())        # 添加左侧面板(调用create_left_panel方法)
@@ -805,21 +830,21 @@ class GradioLikeApp(QMainWindow):
         t.start()
         return self._http_port
 
-    def _load_glb_in_viewer(self, glb_path):
-        """在嵌入的 Babylon.js 查看器中加载 GLB 文件"""
+    def _load_glb_in_viewer(self, glb_path, viewer=None):
+        """在 Babylon.js 查看器中加载点云（可指定 viewer，默认 pointcloud_viewer）"""
         glb_dir = os.path.dirname(os.path.abspath(glb_path))
         glb_name = os.path.basename(glb_path)
+        viewer = viewer or self.pointcloud_viewer
 
         port = self._start_http_server(glb_dir)
         if not port:
-            self.pointcloud_viewer.setHtml(
-                "<h3 style='color:red;text-align:center;margin-top:100px'>"
-                "无法启动 HTTP 服务器</h3>")
+            viewer.setHtml("<h3 style='color:red;text-align:center;margin-top:100px'>"
+                           "无法启动 HTTP 服务器</h3>")
             return
 
         glb_url = f"http://127.0.0.1:{port}/{glb_name}"
 
-        self.pointcloud_viewer.setHtml(f"""
+        viewer.setHtml(f"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -1011,28 +1036,45 @@ class GradioLikeApp(QMainWindow):
         t = QWidget()
         l = QVBoxLayout(t)
 
-        # 左右分栏：摄像头 | 深度图
+        # 左右分栏 1:2
         panels = QHBoxLayout()
+        panels.setStretch(0, 1)
+        panels.setStretch(1, 3)
 
-        # 左：摄像头
-        left = QVBoxLayout()
+        # 左边：上下两栏（摄像头 | 深度图）
+        left_panel = QVBoxLayout()
         self.cam_label = QLabel("摄像头未开启")
         self.cam_label.setAlignment(Qt.AlignCenter)
-        self.cam_label.setMinimumHeight(350)
+        self.cam_label.setMinimumHeight(180)
+        self.cam_label.setScaledContents(True)
         self.cam_label.setStyleSheet(
-            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
-        left.addWidget(self.cam_label)
-        panels.addLayout(left)
+            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 12px;")
+        left_panel.addWidget(self.cam_label)
 
-        # 右：深度图
-        right = QVBoxLayout()
         self.cam_depth_label = QLabel("深度图")
         self.cam_depth_label.setAlignment(Qt.AlignCenter)
-        self.cam_depth_label.setMinimumHeight(350)
+        self.cam_depth_label.setMinimumHeight(180)
+        self.cam_depth_label.setScaledContents(True)
         self.cam_depth_label.setStyleSheet(
-            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
-        right.addWidget(self.cam_depth_label)
-        panels.addLayout(right)
+            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 12px;")
+        left_panel.addWidget(self.cam_depth_label)
+
+        panels.addLayout(left_panel)
+
+        # 右边：3D 点云实时显示（Babylon.js）
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        self.cam_3d_view = QWebEngineView()
+        self.cam_3d_view.setMinimumHeight(380)
+        self.cam_3d_view.setHtml("""
+            <html><body style="background:#1a1a2e;display:flex;align-items:center;
+            justify-content:center;height:100vh;margin:0;font-family:sans-serif">
+            <div style="text-align:center;color:#e0e0e0">
+            <div style="font-size:36px;margin-bottom:12px">&#127758;</div>
+            <div style="font-size:14px">3D 点云（实时）</div>
+            <div style="font-size:11px;color:#888;margin-top:6px">开启摄像头后自动更新</div>
+            </div></body></html>
+        """)
+        panels.addWidget(self.cam_3d_view)
 
         l.addLayout(panels)
 
@@ -1044,6 +1086,13 @@ class GradioLikeApp(QMainWindow):
             "QPushButton:hover { background-color: #1976D2; }")
         self.cam_toggle_btn.clicked.connect(self._on_toggle_camera)
         ctrl.addWidget(self.cam_toggle_btn)
+
+        self.cam_save_btn = QPushButton("💾 截图保存")
+        self.cam_save_btn.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; padding: 6px 14px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #45a049; }")
+        self.cam_save_btn.clicked.connect(self._on_cam_save)
+        ctrl.addWidget(self.cam_save_btn)
         ctrl.addStretch()
         l.addLayout(ctrl)
 
@@ -1051,6 +1100,8 @@ class GradioLikeApp(QMainWindow):
         self._cam_depth_running = False
         self._cam_timer = QTimer()
         self._cam_timer.timeout.connect(self._on_cam_frame)
+        self._cam_last_frame = None  # 最新帧
+        self._cam_last_depth = None  # 最新深度图
         return t
 
     def _on_toggle_camera(self):
@@ -1067,6 +1118,13 @@ class GradioLikeApp(QMainWindow):
             self.cam_label.setText("摄像头未开启")
             self.cam_label.setStyleSheet(
                 "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
+            self.cam_3d_view.setHtml("""
+                <html><body style="background:#1a1a2e;display:flex;align-items:center;
+                justify-content:center;height:100vh;margin:0;font-family:sans-serif">
+                <div style="text-align:center;color:#e0e0e0">
+                <div style="font-size:36px;margin-bottom:12px">&#127758;</div>
+                <div style="font-size:14px">3D 点云（实时）</div></div></body></html>
+            """)
             self.cam_toggle_btn.setText("📷 开启摄像头")
         else:
             import cv2
@@ -1092,20 +1150,48 @@ class GradioLikeApp(QMainWindow):
         ret, frame = self._cam_cap.read()
         if not ret:
             return
-        # 显示 RGB 画面
+        self._cam_last_frame = frame.copy()  # 保存最新帧
+
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
         h, w, _ = rgb.shape
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.cam_label.width(), self.cam_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.cam_label.setPixmap(pix)
+        self.cam_label.setPixmap(QPixmap.fromImage(qimg))
 
-        # 提交帧给持久线程（自动丢弃旧帧，避免积压）
         if hasattr(self, '_cam_persistent_worker') and self._cam_persistent_worker:
             self._cam_persistent_worker.submit_frame(frame)
 
-    def _on_cam_depth_finished(self, depth):
+    def _on_cam_save(self):
+        """保存当前帧的深度图和点云"""
+        if self._cam_last_frame is None:
+            self.status_label.setText("⚠️ 无帧可保存")
+            return
+        save_dir = os.path.join("output", "cam_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 保存 RGB 帧
+        import cv2
+        cv2.imwrite(os.path.join(save_dir, "frame.png"), self._cam_last_frame)
+
+        # 保存彩色深度图
+        if hasattr(self, '_cam_last_depth') and self._cam_last_depth is not None:
+            from depth_anything_3.utils.visualize import visualize_depth
+            depth_color = visualize_depth(self._cam_last_depth)
+            cv2.imwrite(os.path.join(save_dir, "depth.png"),
+                        depth_color[:, :, ::-1])  # RGB→BGR for cv2
+
+            # 生成 PLY 点云并保存
+            pts_3d = _depth_to_points(self._cam_last_frame, self._cam_last_depth)
+            if pts_3d is not None:
+                ply = trimesh.PointCloud(vertices=pts_3d)
+                colors = self._cam_last_frame.reshape(-1, 3)[:, ::-1] / 255.0
+                ply.colors = colors
+                ply.export(os.path.join(save_dir, "pointcloud.ply"))
+                ply.export(os.path.join(save_dir, "pointcloud.glb"))
+
+        self.status_label.setText(f"💾 已保存: {save_dir}")
+
+    def _on_cam_depth_finished(self, depth, intrinsics=None, conf=None):
+        self._cam_last_depth = depth
         from depth_anything_3.utils.visualize import visualize_depth
         d_vis = visualize_depth(depth)
         h, w, _ = d_vis.shape
@@ -1115,6 +1201,33 @@ class GradioLikeApp(QMainWindow):
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.cam_depth_label.setPixmap(pix)
         self.cam_depth_label.setText("")
+
+        try:
+            self._update_cam_3d(depth, intrinsics, conf)
+        except Exception:
+            pass
+
+    def _update_cam_3d(self, depth, intrinsics=None, conf=None):
+        """深度图 → 3D 点云（用模型真实内参，速度快）"""
+        import tempfile
+        if intrinsics is not None and intrinsics.shape == (3, 3):
+            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        else:
+            fx = fy = 500
+        pts = _depth_to_points(self._cam_last_frame, depth, fx=fx, fy=fy)
+        if pts is None or len(pts) < 100:
+            return
+        # XYZ 翻转（OpenCV→OpenGL）
+        pts[:, 0] *= -1
+        pts[:, 1] *= -1
+        pts[:, 2] *= -1
+        tmp_dir = tempfile.mkdtemp(prefix="cam3d_")
+        ply_path = os.path.join(tmp_dir, "cam.ply")
+        ply = trimesh.PointCloud(vertices=pts)
+        colors = self._cam_last_frame.reshape(-1, 3)[:, ::-1] / 255.0
+        ply.colors = colors[:len(pts)]
+        ply.export(ply_path)
+        self._load_glb_in_viewer(ply_path, viewer=self.cam_3d_view)
 
     def _on_cam_depth_error(self, err):
         self._cam_depth_running = False
