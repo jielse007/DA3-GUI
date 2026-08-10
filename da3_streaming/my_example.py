@@ -97,7 +97,7 @@ class VideoFrameRunnable(QRunnable):
 # 持久摄像头深度计算线程（常驻，复用线程，避免频繁创建销毁）
 # ============================================================
 class PersistentCamWorker(QThread):
-    finished = Signal(object)
+    finished = Signal(str)  # DA3 输出目录
     error    = Signal(str)
 
     def __init__(self, cached_model):
@@ -119,7 +119,7 @@ class PersistentCamWorker(QThread):
             self._cond.notify()
 
     def run(self):
-        import tempfile, cv2
+        import tempfile, cv2, importlib.util
         while True:
             with self._lock:
                 while self._latest_frame is None and self._running:
@@ -130,35 +130,36 @@ class PersistentCamWorker(QThread):
                 self._latest_frame = None
 
             try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                    cv2.imwrite(f.name, frame)
-                    tmp_path = f.name
-                prediction = self.cached_model.inference([tmp_path])
-                os.unlink(tmp_path)
-                depth = np.squeeze(prediction.depth)
-                self.finished.emit(depth)
+                # 保存帧到临时目录（DA3_Streaming 需要文件夹输入）
+                tmp_dir = tempfile.mkdtemp(prefix="cam_da3_")
+                img_path = os.path.join(tmp_dir, "frame_000000.png")
+                cv2.imwrite(img_path, frame)
+
+                # 加载 DA3_Streaming（仅首次，之后复用 sys.modules 缓存）
+                _here = os.path.dirname(os.path.abspath(__file__))
+                _src = os.path.join(_here, "..", "src")
+                sys.path.insert(0, _src)
+                sys.path.insert(0, _here)
+
+                _spec = importlib.util.spec_from_file_location(
+                    "da3_streaming_cam", os.path.join(_here, "da3_streaming.py"))
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                from loop_utils.config_utils import load_config
+                sys.path.remove(_here)
+
+                # 创建 DA3_Streaming 实例并运行（与主流程完全一致）
+                config = load_config("da3_streaming/configs/base_config.yaml")
+                da3 = _mod.DA3_Streaming(tmp_dir, os.path.join(tmp_dir, "out"), config)
+                da3.run()
+                da3.close()
+
+                # 发出 DA3 输出目录
+                output_dir = os.path.join(tmp_dir, "out")
+                self.finished.emit(output_dir)
             except Exception as e:
                 import traceback
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
-
-
-# ============================================================
-# 深度图 → 3D 点云（用于摄像头实时保存）
-# ============================================================
-def _depth_to_points(frame_bgr, depth, fx=500, fy=500):
-    """将深度图转为 3D 点云（相机坐标系）"""
-    h, w = depth.shape
-    cx, cy = w / 2, h / 2
-    u = np.arange(w)
-    v = np.arange(h)
-    uu, vv = np.meshgrid(u, v)
-    z = depth
-    x = (uu - cx) * z / fx
-    y = (vv - cy) * z / fy
-    pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
-    # 滤除无效点
-    valid = (z.reshape(-1) > 0.01)
-    return pts[valid]
 
 
 # ============================================================
@@ -1161,73 +1162,76 @@ class GradioLikeApp(QMainWindow):
             self._cam_persistent_worker.submit_frame(frame)
 
     def _on_cam_save(self):
-        """保存当前帧的深度图和点云"""
+        """保存当前帧：frame.png + depth.png + combined.glb"""
         if self._cam_last_frame is None:
             self.status_label.setText("⚠️ 无帧可保存")
             return
         save_dir = os.path.join("output", "cam_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
         os.makedirs(save_dir, exist_ok=True)
 
-        # 保存 RGB 帧
         import cv2
+        # 1. RGB 帧
         cv2.imwrite(os.path.join(save_dir, "frame.png"), self._cam_last_frame)
 
-        # 保存彩色深度图
+        # 2. 彩色深度图
         if hasattr(self, '_cam_last_depth') and self._cam_last_depth is not None:
             from depth_anything_3.utils.visualize import visualize_depth
             depth_color = visualize_depth(self._cam_last_depth)
             cv2.imwrite(os.path.join(save_dir, "depth.png"),
-                        depth_color[:, :, ::-1])  # RGB→BGR for cv2
+                        depth_color[:, :, ::-1])
 
-            # 生成 PLY 点云并保存
-            pts_3d = _depth_to_points(self._cam_last_frame, self._cam_last_depth)
-            if pts_3d is not None:
-                ply = trimesh.PointCloud(vertices=pts_3d)
-                colors = self._cam_last_frame.reshape(-1, 3)[:, ::-1] / 255.0
-                ply.colors = colors
-                ply.export(os.path.join(save_dir, "pointcloud.ply"))
-                ply.export(os.path.join(save_dir, "pointcloud.glb"))
+        # 3. 从 DA3 输出目录拷贝 combined.glb（与主流程一致）
+        if hasattr(self, '_cam_last_output_dir'):
+            src_glb = os.path.join(self._cam_last_output_dir, "combined.glb")
+            if os.path.exists(src_glb):
+                shutil.copy2(src_glb, os.path.join(save_dir, "combined.glb"))
 
         self.status_label.setText(f"💾 已保存: {save_dir}")
 
-    def _on_cam_depth_finished(self, depth, intrinsics=None, conf=None):
+    def _on_cam_depth_finished(self, output_dir):
+        """接收 DA3_Streaming 输出目录，读取深度图并显示 3D 点云"""
+        self._cam_last_output_dir = output_dir  # 保存输出目录，供截图使用
+        npz_dir = os.path.join(output_dir, "results_output")
+        npz_files = sorted(glob.glob(os.path.join(npz_dir, "frame_*.npz")))
+        if not npz_files:
+            return
+        data = np.load(npz_files[0])
+        depth = data["depth"]
         self._cam_last_depth = depth
+
         from depth_anything_3.utils.visualize import visualize_depth
         d_vis = visualize_depth(depth)
         h, w, _ = d_vis.shape
         qimg = QImage(d_vis.data, w, h, w * 3, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.cam_depth_label.width(), self.cam_depth_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.cam_depth_label.setPixmap(pix)
+        self.cam_depth_label.setPixmap(QPixmap.fromImage(qimg))
         self.cam_depth_label.setText("")
 
         try:
-            self._update_cam_3d(depth, intrinsics, conf)
+            self._update_cam_3d(output_dir)
         except Exception:
             pass
 
-    def _update_cam_3d(self, depth, intrinsics=None, conf=None):
-        """深度图 → 3D 点云（用模型真实内参，速度快）"""
-        import tempfile
-        if intrinsics is not None and intrinsics.shape == (3, 3):
-            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        else:
-            fx = fy = 500
-        pts = _depth_to_points(self._cam_last_frame, depth, fx=fx, fy=fy)
-        if pts is None or len(pts) < 100:
-            return
-        # XYZ 翻转（OpenCV→OpenGL）
-        pts[:, 0] *= -1
-        pts[:, 1] *= -1
-        pts[:, 2] *= -1
-        tmp_dir = tempfile.mkdtemp(prefix="cam3d_")
-        ply_path = os.path.join(tmp_dir, "cam.ply")
-        ply = trimesh.PointCloud(vertices=pts)
-        colors = self._cam_last_frame.reshape(-1, 3)[:, ::-1] / 255.0
-        ply.colors = colors[:len(pts)]
-        ply.export(ply_path)
-        self._load_glb_in_viewer(ply_path, viewer=self.cam_3d_view)
+    def _update_cam_3d(self, output_dir):
+        """DA3 输出目录 → npz → GLB → 3D 显示"""
+        import importlib.util
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _spec = importlib.util.spec_from_file_location(
+            "npz_proc", os.path.join(_here, "npz_output_process.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+
+        res_dir = os.path.join(output_dir, "results_output")
+        poses_file = os.path.join(output_dir, "camera_poses.txt")
+        glb_path = os.path.join(output_dir, "combined.glb")
+
+        if os.path.exists(res_dir) and os.path.exists(poses_file):
+            _mod.create_point_cloud(
+                npz_folder=res_dir, pose_file=poses_file,
+                output_ply=os.path.join(output_dir, "combined.ply"),
+                conf_threshold_coef=0.5, sample_ratio=1.0)
+
+        if os.path.exists(glb_path):
+            self._load_glb_in_viewer(glb_path, viewer=self.cam_3d_view)
 
     def _on_cam_depth_error(self, err):
         self._cam_depth_running = False
