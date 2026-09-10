@@ -795,27 +795,37 @@ class GradioLikeApp(QMainWindow):
         self._http_port = None
         return t
 
-    def _start_http_server(self, serve_dir):
-        """启动本地 HTTP 服务器（每次关闭旧服务，确保指向新目录）"""
-        # 关闭旧的 HTTP 服务
-        if self._http_server:
-            self._http_server.shutdown()
-            self._http_server = None
-            self._http_port = None
+    def _start_http_server(self, serve_dir, cam=False):
+        """启动本地 HTTP 服务器（主流程与摄像头各用一个，互不干扰）
+        cam=False: 主流程服务器（端口 8765-8790）
+        cam=True : 摄像头服务器（端口 8791-8816）
+        """
+        srv_attr  = "_cam_http_server" if cam else "_http_server"
+        port_attr = "_cam_http_port"   if cam else "_http_port"
+        ports     = range(8791, 8816)  if cam else range(8765, 8790)
+
+        # 关闭同类型的旧服务（只关自己那套，不影响另一套）
+        old = getattr(self, srv_attr, None)
+        if old:
+            old.shutdown()
+            setattr(self, srv_attr, None)
+            setattr(self, port_attr, None)
 
         # 找空闲端口
-        for port in range(8765, 8790):
+        port = None
+        for p in ports:
             try:
                 s = socket.socket()
-                s.bind(('', port))
+                s.bind(('', p))
                 s.close()
-                self._http_port = port
+                port = p
                 break
             except OSError:
                 continue
 
-        if not self._http_port:
+        if not port:
             return None
+        setattr(self, port_attr, port)
 
         class CORSHandler(SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
@@ -826,18 +836,20 @@ class GradioLikeApp(QMainWindow):
                 self.send_header("Access-Control-Allow-Headers", "*")
                 super().end_headers()
 
-        self._http_server = HTTPServer(('127.0.0.1', self._http_port), CORSHandler)
-        t = threading.Thread(target=self._http_server.serve_forever, daemon=True)
+        server = HTTPServer(('127.0.0.1', port), CORSHandler)
+        setattr(self, srv_attr, server)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
-        return self._http_port
+        return port
 
-    def _load_glb_in_viewer(self, glb_path, viewer=None):
-        """在 Babylon.js 查看器中加载点云（可指定 viewer，默认 pointcloud_viewer）"""
+    def _load_glb_in_viewer(self, glb_path, viewer=None, cam=False):
+        """在 Babylon.js 查看器中加载点云（可指定 viewer，默认 pointcloud_viewer）
+        cam=True 时使用摄像头专属 HTTP 服务器，避免与主流程互相覆盖"""
         glb_dir = os.path.dirname(os.path.abspath(glb_path))
         glb_name = os.path.basename(glb_path)
         viewer = viewer or self.pointcloud_viewer
 
-        port = self._start_http_server(glb_dir)
+        port = self._start_http_server(glb_dir, cam=cam)
         if not port:
             viewer.setHtml("<h3 style='color:red;text-align:center;margin-top:100px'>"
                            "无法启动 HTTP 服务器</h3>")
@@ -1103,6 +1115,9 @@ class GradioLikeApp(QMainWindow):
         self._cam_timer.timeout.connect(self._on_cam_frame)
         self._cam_last_frame = None  # 最新帧
         self._cam_last_depth = None  # 最新深度图
+        self._cam_http_server = None  # 摄像头专属 HTTP 服务器（与主流程独立）
+        self._cam_http_port = None
+        self._cam_prev_tmp_dir = None  # 上一帧临时目录（新帧就绪后清理）
         return t
 
     def _on_toggle_camera(self):
@@ -1115,6 +1130,11 @@ class GradioLikeApp(QMainWindow):
                 self._cam_persistent_worker.stop()
                 self._cam_persistent_worker.wait()
                 self._cam_persistent_worker = None
+            # 关闭摄像头专属 HTTP 服务器
+            if hasattr(self, '_cam_http_server') and self._cam_http_server:
+                self._cam_http_server.shutdown()
+                self._cam_http_server = None
+                self._cam_http_port = None
             self.cam_label.setPixmap(QPixmap())
             self.cam_label.setText("摄像头未开启")
             self.cam_label.setStyleSheet(
@@ -1231,7 +1251,14 @@ class GradioLikeApp(QMainWindow):
                 conf_threshold_coef=0.5, sample_ratio=1.0)
 
         if os.path.exists(glb_path):
-            self._load_glb_in_viewer(glb_path, viewer=self.cam_3d_view)
+            self._load_glb_in_viewer(glb_path, viewer=self.cam_3d_view, cam=True)
+
+            # 新帧显示就绪后，清理上一帧的临时目录
+            # （此时摄像头服务器已切换到新目录，旧目录不再被引用）
+            prev_tmp = getattr(self, "_cam_prev_tmp_dir", None)
+            if prev_tmp and os.path.isdir(prev_tmp):
+                shutil.rmtree(prev_tmp, ignore_errors=True)
+            self._cam_prev_tmp_dir = os.path.dirname(output_dir)
 
     def _on_cam_depth_error(self, err):
         self._cam_depth_running = False
@@ -1410,11 +1437,15 @@ class GradioLikeApp(QMainWindow):
         QThreadPool.globalInstance().clear()
         QThreadPool.globalInstance().waitForDone()
 
-        # 关闭 HTTP 服务器
+        # 关闭 HTTP 服务器（主流程 + 摄像头两套）
         if self._http_server:
             self._http_server.shutdown()
             self._http_server = None
             self._http_port = None
+        if hasattr(self, '_cam_http_server') and self._cam_http_server:
+            self._cam_http_server.shutdown()
+            self._cam_http_server = None
+            self._cam_http_port = None
 
         # 重置上传进度
         self.upload_bar.setValue(0)
