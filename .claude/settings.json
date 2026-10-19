@@ -37,7 +37,22 @@
       "Bash(sed -i '1224s/.*/            f.write\\(\"1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1\\\\\\\\n\"\\)/' da3_streaming/my_example.py)",
       "Bash(sed -i '/^\"\\)$/d' da3_streaming/my_example.py)",
       "Bash(venv/Scripts/python.exe _fix_line.py)",
-      "Bash(rm _fix_line.py)"
+      "Bash(rm _fix_line.py)",
+      "Bash(PYTHONIOENCODING=utf-8 venv/Scripts/python.exe -c ' *)",
+      "Bash(PYTHONIOENCODING=gbk venv/Scripts/python.exe -c ' *)",
+      "Bash(venv/Scripts/python.exe -m py_compile da3_streaming/my_example.py)",
+      "Bash(python -c \"import openpyxl; print\\(openpyxl.__version__\\)\")",
+      "Read(//c/Users/86158/**)",
+      "Bash(ls /c/Users/86158/ | head -50; echo \"---\"; ls -d /c/Users/86158/OneDrive* 2>/dev/null)",
+      "Read(//c/Users/86158//**)",
+      "Read(//c/Users/86158/OneDrive//**)",
+      "Read(//c/Users/86158/OneDrive/**)",
+      "Bash(reg query *)",
+      "Bash(powershell -NoProfile -Command \"[Environment]::GetFolderPath\\('Desktop'\\)\")",
+      "Bash(python -V)",
+      "Bash(python -c \"import xlsxwriter; print\\('xlsxwriter ok'\\)\")",
+      "Bash(python -m pip install openpyxl)",
+      "Bash(python -c ' *)"
     ]
   }
 }

@@ -163,24 +163,177 @@ class PersistentCamWorker(QThread):
 
 
 # ============================================================
-# RANSAC 地面平面检测 + 坐标轴，合并到 GLB
+# RANSAC 地面平面检测 + 坐标轴，合并到 GLB（纯 numpy，无额外依赖）
 # ============================================================
-def _add_ground_plane(ply_path):
-    """对点云做 RANSAC 平面拟合，生成地面面片+坐标轴，合并到 GLB"""
-    from sklearn.linear_model import RANSACRegressor
+# 上轴：0=X, 1=Y, 2=Z
+# DA3 输出在 npz_output_process.py 中做了 YZ 翻转（OpenCV→OpenGL），
+# OpenGL 与 Babylon.js 惯例均为 Y 朝上，因此这里默认 Y。
+# ⚠️ 若地面网格显示成"竖直的墙"，说明上轴判断错误 → 改成 2 再试。
+_UP_AXIS = 1
+# 水平性阈值：平面法向量与上轴夹角 < 20° 才算"水平面"（用于排除墙）
+_HORIZ_COS = float(np.cos(np.radians(20.0)))
+# 打印候选平面诊断信息（确认上轴 / 调参时可打开，稳定后可关）
+_GROUND_DEBUG = False
 
+
+def _refine_plane(pts):
+    """对 inlier 点用 PCA 精修平面，返回 (单位法向量 n, 截距 d)，平面方程 n·x + d = 0"""
+    c = pts.mean(axis=0)
+    # 最小奇异向量即为平面法向量
+    _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+    n = vt[-1]
+    n = n / np.linalg.norm(n)
+    return n, -float(n @ c)
+
+
+def _fit_plane_ransac(pts, thresh, iters=800):
+    """纯 numpy 的 3D 平面 RANSAC
+
+    每次随机取 3 点 → 叉乘求过这 3 点的平面 → 统计到该平面距离 < thresh 的点数，
+    保留 inlier 最多的那个平面，最后用全部 inlier 做 PCA 精修。
+    返回 (单位法向量 n, 截距 d, inlier 布尔掩码)；失败时返回 (None, None, None)。
+    """
+    n_pts = len(pts)
+    if n_pts < 3:
+        return None, None, None
+
+    best_cnt, best_n, best_d, best_mask = 0, None, None, None
+    for _ in range(iters):
+        p0, p1, p2 = pts[np.random.choice(n_pts, 3, replace=False)]
+        n = np.cross(p1 - p0, p2 - p0)
+        norm = np.linalg.norm(n)
+        if norm < 1e-9:          # 三点共线，无法确定平面
+            continue
+        n = n / norm
+        d = -float(n @ p0)
+        mask = np.abs(pts @ n + d) < thresh
+        cnt = int(mask.sum())
+        if cnt > best_cnt:
+            best_cnt, best_n, best_d, best_mask = cnt, n, d, mask
+
+    if best_mask is None or best_cnt < 3:
+        return None, None, None
+
+    # 用 inlier 全集精修（RANSAC 的 3 点解噪声大，PCA 拟合更准）
+    n, d = _refine_plane(pts[best_mask])
+    mask = np.abs(pts @ n + d) < thresh
+    return n, d, mask
+
+
+def _plane_grid_mesh(n, d, pts_in, grid=20):
+    """在真 3D 平面 (n·x+d=0) 上生成矩形网格面片
+
+    真 3D 平面无法用 z=f(x,y) 表达（墙/天花板会造成 x,y 一对多），
+    因此必须先在平面内构造正交基 (u, v)，再把 inlier 投影到该基底求展布。
+    """
+    c = pts_in.mean(axis=0)                      # 平面中心
+    # 构造平面内正交基：取与法向量最不平行的坐标轴做参考
+    ref = np.zeros(3)
+    ref[int(np.argmin(np.abs(n)))] = 1.0
+    u = np.cross(n, ref); u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    rel = pts_in - c
+    su, sv = rel @ u, rel @ v
+    u0, u1 = float(su.min()), float(su.max())
+    v0, v1 = float(sv.min()), float(sv.max())
+    # 外扩 10% 边距
+    mu, mv = 0.1 * (u1 - u0), 0.1 * (v1 - v0)
+    u0, u1, v0, v1 = u0 - mu, u1 + mu, v0 - mv, v1 + mv
+
+    us = np.linspace(u0, u1, grid)
+    vs = np.linspace(v0, v1, grid)
+    U, V = np.meshgrid(us, vs)
+    verts = (c[None, :] + U.ravel()[:, None] * u[None, :]
+             + V.ravel()[:, None] * v[None, :])
+
+    faces = []
+    for i in range(grid - 1):
+        for j in range(grid - 1):
+            a = i * grid + j
+            faces.append([a, a + 1, a + grid])
+            faces.append([a + 1, a + grid + 1, a + grid])
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces))
+    extent = max(u1 - u0, v1 - v0)
+    return mesh, extent, c
+
+
+def _detect_ground_plane(pts, thresh):
+    """顺序 RANSAC 剥离候选平面，再按「水平性 / 低位性 / 支撑性」选出地面
+
+    ① 水平性  |n·up| > cos(20°)      → 排除墙
+    ② 低位性  平面高度 < 点云质心高度   → 排除天花板
+    ③ 支撑性  平面上方点数 >> 下方点数   → 排除天花板/悬空面
+    最后在通过者中取「位置最低」的 → 地面是支撑一切的最低水平面，桌面必在其上方
+
+    返回 (选中的平面 dict 或 None, 全部候选列表)
+    """
+    up = np.zeros(3); up[_UP_AXIS] = 1.0
+    all_h = pts[:, _UP_AXIS]                     # 全量高度，用于低位性/支撑性统计
+    # 用 1%/99% 分位数而非极值，避免离群点把高度区间撑坏
+    h_lo = float(np.percentile(all_h, 1))
+    h_hi = float(np.percentile(all_h, 99))
+    span = max(h_hi - h_lo, 1e-6)
+
+    work, cands = pts, []
+    for _ in range(5):                            # 最多剥离 5 个平面
+        if len(work) < 500:
+            break
+        n, d, mask = _fit_plane_ransac(work, thresh)
+        if n is None or int(mask.sum()) < 500:
+            break
+
+        plane_pts = work[mask]
+        if n @ up < 0:                            # 统一法向量朝上，便于比较高低
+            n, d = -n, -d
+        height   = float(plane_pts[:, _UP_AXIS].mean())
+        cos_tilt = float(abs(n @ up))             # 1.0 = 完全水平
+        # 支撑性在全量点云上统计（而非逐轮缩小的 work，否则语义随剥离进度漂移）
+        above = int((all_h > height + thresh).sum())
+        below = int((all_h < height - thresh).sum())
+
+        # ① 水平性：过滤掉墙
+        ok_tilt = cos_tilt > _HORIZ_COS
+        # ② 低位性：地面不能是点云里最高的那一层
+        #    用 h_hi 作上界而非"低于质心/中位数"——当地面就是全部点云时，
+        #    地面高度恰等于中位数，任何以中位数为界的判据都会恒假而误杀
+        ok_low = height < h_hi - 0.1 * span
+        # ③ 支撑性：平面上方点数不少于下方 —— 地面支撑万物，天花板反之
+        #    用 >= 而非倍数，保证"场景只有单一水平面"时不被误杀
+        ok_supp = above >= below
+        cands.append(dict(n=n, d=d, pts=plane_pts, cnt=int(mask.sum()),
+                          height=height, cos_tilt=cos_tilt,
+                          above=above, below=below,
+                          ok=ok_tilt and ok_low and ok_supp))
+
+        work = work[~mask]                        # 剥离该平面继续找下一个
+
+    valid = [c for c in cands if c["ok"]]
+    if not valid:
+        return None, cands
+    valid.sort(key=lambda c: (c["height"], -c["cnt"]))   # 最低者胜，同高取点多者
+    return valid[0], cands
+
+
+def _add_ground_plane(ply_path):
+    """对点云做 RANSAC 地面检测，生成地面面片+坐标轴，合并到 GLB"""
     # 1. 加载点云
     scene = trimesh.load(ply_path)
     # 点云可能是 PointCloud 或 Trimesh，统一获取顶点
+    def _safe_colors(arr, n_pts):
+        """取顶点颜色；形状不对（无颜色/维度不符）时返回 None，避免 IndexError"""
+        if arr is None:
+            return None
+        c = np.asarray(arr)
+        return c[:, :3] if (c.ndim == 2 and len(c) == n_pts) else None
+
     if isinstance(scene, trimesh.Trimesh):
         pts = np.asarray(scene.vertices)
-        if hasattr(scene.visual, 'vertex_colors'):
-            colors = np.asarray(scene.visual.vertex_colors)[:, :3]
-        else:
-            colors = None
+        colors = _safe_colors(getattr(scene.visual, 'vertex_colors', None), len(pts))
     elif isinstance(scene, trimesh.PointCloud):
         pts = np.asarray(scene.vertices)
-        colors = np.asarray(scene.colors)[:, :3] if hasattr(scene, 'colors') and scene.colors is not None else None
+        colors = _safe_colors(getattr(scene, 'colors', None), len(pts))
     else:
         return
 
@@ -198,62 +351,59 @@ def _add_ground_plane(ply_path):
     if pc_col is not None and len(pc_col) == len(pc_pts):
         pc_mesh.colors = pc_col
 
-    n = min(50000, len(pts))
-    idx = np.random.choice(len(pts), n, replace=False)
-    sample = pts[idx]
+    # 2. 地面检测（纯 numpy 3D RANSAC + 三条件约束）
+    n_fit = min(50000, len(pts))
+    sample = pts[np.random.choice(len(pts), n_fit, replace=False)]
 
-    # 2. RANSAC 找最大平面（地面）
-    ransac = RANSACRegressor(residual_threshold=0.05, max_trials=500)
-    ransac.fit(sample[:, :2], sample[:, 2])
-    inliers = ransac.inlier_mask_
+    # 距离阈值随场景尺度自适应（DA3 输出尺度是 sim3 对齐后的任意尺度）
+    diag = float(np.linalg.norm(np.ptp(pts, axis=0)))
+    thresh = float(np.clip(0.008 * diag, 0.01, 0.2))
 
-    if inliers.sum() < 100:
-        # 找不到平面 → 退化为场景中心坐标轴
-        cx, cy, cz = pts.mean(axis=0)
-        axis_len = np.ptp(pts, axis=0).max() * 0.3
-        a = b = c = 0
-    else:
-        a, b = ransac.estimator_.coef_
-        c = ransac.estimator_.intercept_
-        ground_pts = sample[inliers]
-        x_min, x_max = ground_pts[:, 0].min(), ground_pts[:, 0].max()
-        y_min, y_max = ground_pts[:, 1].min(), ground_pts[:, 1].max()
-        margin = 0.1 * max(x_max - x_min, y_max - y_min)
-        x_min -= margin; x_max += margin
-        y_min -= margin; y_max += margin
-        axis_len = max(x_max - x_min, y_max - y_min) * 0.2
-        cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
-        cz = a * cx + b * cy + c
+    ground, cands = _detect_ground_plane(sample, thresh)
 
-        # 3. 生成地面矩形网格
-        xs = np.linspace(x_min, x_max, 20)
-        ys = np.linspace(y_min, y_max, 20)
-        X, Y = np.meshgrid(xs, ys)
-        Z = a * X + b * Y + c
-        plane_verts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
-        plane_faces = []
-        for i in range(19):
-            for j in range(19):
-                v00 = i * 20 + j
-                # 三角形 1: v00, v00+1, v00+20
-                plane_faces.append([v00, v00 + 1, v00 + 20])
-                # 三角形 2: v00+1, v00+21, v00+20
-                plane_faces.append([v00 + 1, v00 + 21, v00 + 20])
-        plane_mesh = trimesh.Trimesh(vertices=plane_verts, faces=plane_faces)
+    if _GROUND_DEBUG:
+        axis_names = "XYZ"
+        print(f"[地面检测] 上轴={axis_names[_UP_AXIS]}  阈值={thresh:.4f}  "
+              f"点数={len(sample)}")
+        for a in range(3):
+            print(f"            {axis_names[a]} 范围: "
+                  f"{pts[:, a].min():.3f} ~ {pts[:, a].max():.3f}  "
+                  f"(质心 {pts[:, a].mean():.3f})")
+        for i, c in enumerate(cands):
+            mark = "[通过]" if c["ok"] else "[淘汰]"   # 避免 GBK 控制台编码报错
+            print(f"            平面{i}: 点数={c['cnt']:>6} 高度={c['height']:.3f} "
+                  f"水平度={c['cos_tilt']:.3f} 上方={c['above']} 下方={c['below']} {mark}")
+        if ground:
+            print(f"            -> 选中: 点数={ground['cnt']} 高度={ground['height']:.3f}")
+        else:
+            print("            -> 未找到符合约束的地面平面，退化为场景中心坐标轴")
+            print(f"               提示: 若确认场景里有地面，可能上轴判断有误，"
+                  f"可把 _UP_AXIS 改成 {( _UP_AXIS + 1) % 3} 或 {( _UP_AXIS + 2) % 3} 再试")
+
+    # 3. 地面网格 / 坐标轴
+    plane_mesh = None
+    if ground is not None:
+        plane_mesh, extent, center = _plane_grid_mesh(
+            ground["n"], ground["d"], ground["pts"])
         plane_mesh.visual.vertex_colors = [80, 200, 80, 50]
+        axis_len = extent * 0.2
+    else:
+        # 兜底：场景中心放一组坐标轴，不画地面
+        center = pts.mean(axis=0)
+        axis_len = float(np.ptp(pts, axis=0).max()) * 0.3
 
-    # 4. 坐标轴
-    origin = np.array([cx, cy, cz])
+    # 4. 坐标轴（世界轴对齐，原点落在地面中心）
+    origin = np.asarray(center)
     colors_axis = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
     axes_meshes = []
     directions = [[axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]]
-    for i, (d, col) in enumerate(zip(directions, colors_axis)):
+    for i, (d_vec, col) in enumerate(zip(directions, colors_axis)):
         seg = trimesh.creation.cylinder(radius=axis_len * 0.02, height=axis_len, sections=8)
         if i == 0:
             seg.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [0, 1, 0]))
         elif i == 1:
             seg.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
-        seg.apply_translation(origin + np.array(d) * 0.5)
+        seg.apply_translation(origin + np.array(d_vec) * 0.5)
         seg.visual.vertex_colors = col
         axes_meshes.append(seg)
 
@@ -261,7 +411,8 @@ def _add_ground_plane(ply_path):
     glb_path = os.path.splitext(ply_path)[0] + ".glb"
     export_scene = trimesh.Scene()
     export_scene.add_geometry(pc_mesh, node_name="pointcloud")
-    export_scene.add_geometry(plane_mesh, node_name="ground")
+    if plane_mesh is not None:
+        export_scene.add_geometry(plane_mesh, node_name="ground")
     for i, ax in enumerate(axes_meshes):
         export_scene.add_geometry(ax, node_name=f"axis_{i}")
     export_scene.export(glb_path)
