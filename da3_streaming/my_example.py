@@ -96,7 +96,7 @@ class VideoFrameRunnable(QRunnable):
 # 持久摄像头深度计算线程（常驻，复用线程，避免频繁创建销毁）
 # ============================================================
 class PersistentCamWorker(QThread):
-    finished = Signal(object)
+    finished = Signal(str)  # DA3 输出目录
     error    = Signal(str)
 
     def __init__(self, cached_model):
@@ -108,19 +108,17 @@ class PersistentCamWorker(QThread):
         self._running = True
 
     def submit_frame(self, frame_bgr):
-        """主线程调用：提交最新帧（只保留最新一帧，旧帧丢弃）"""
         with self._lock:
             self._latest_frame = frame_bgr.copy()
             self._cond.notify()
 
     def stop(self):
-        """停止循环"""
         with self._lock:
             self._running = False
             self._cond.notify()
 
     def run(self):
-        import tempfile, cv2
+        import tempfile, cv2, importlib.util
         while True:
             with self._lock:
                 while self._latest_frame is None and self._running:
@@ -131,20 +129,296 @@ class PersistentCamWorker(QThread):
                 self._latest_frame = None
 
             try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                    cv2.imwrite(f.name, frame)
-                    tmp_path = f.name
-                prediction = self.cached_model.inference([tmp_path])
-                os.unlink(tmp_path)
-                depth = np.squeeze(prediction.depth)
-                self.finished.emit(depth)
+                # 保存帧到临时目录（DA3_Streaming 需要文件夹输入）
+                tmp_dir = tempfile.mkdtemp(prefix="cam_da3_")
+                img_path = os.path.join(tmp_dir, "frame_000000.png")
+                cv2.imwrite(img_path, frame)
+
+                # 加载 DA3_Streaming（仅首次，之后复用 sys.modules 缓存）
+                _here = os.path.dirname(os.path.abspath(__file__))
+                _src = os.path.join(_here, "..", "src")
+                sys.path.insert(0, _src)
+                sys.path.insert(0, _here)
+
+                _spec = importlib.util.spec_from_file_location(
+                    "da3_streaming_cam", os.path.join(_here, "da3_streaming.py"))
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                from loop_utils.config_utils import load_config
+                sys.path.remove(_here)
+
+                # 创建 DA3_Streaming 实例并运行（与主流程完全一致）
+                config = load_config("da3_streaming/configs/base_config.yaml")
+                da3 = _mod.DA3_Streaming(tmp_dir, os.path.join(tmp_dir, "out"), config)
+                da3.run()
+                da3.close()
+
+                # 发出 DA3 输出目录
+                output_dir = os.path.join(tmp_dir, "out")
+                self.finished.emit(output_dir)
             except Exception as e:
                 import traceback
                 self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 # ============================================================
-# RANSAC 地面平面检测 + 坐标轴，合并到 GLB
+# RANSAC 地面平面检测 + 坐标轴，合并到 GLB（纯 numpy，无额外依赖）
+# ============================================================
+# 上轴：0=X, 1=Y, 2=Z
+# DA3 输出在 npz_output_process.py 中做了 YZ 翻转（OpenCV→OpenGL），
+# OpenGL 与 Babylon.js 惯例均为 Y 朝上，因此这里默认 Y。
+# ⚠️ 若地面网格显示成"竖直的墙"，说明上轴判断错误 → 改成 2 再试。
+_UP_AXIS = 1
+# 水平性阈值：平面法向量与上轴夹角 < 20° 才算"水平面"（用于排除墙）
+_HORIZ_COS = float(np.cos(np.radians(20.0)))
+# 打印候选平面诊断信息（确认上轴 / 调参时可打开，稳定后可关）
+_GROUND_DEBUG = False
+
+
+def _refine_plane(pts):
+    """对 inlier 点用 PCA 精修平面，返回 (单位法向量 n, 截距 d)，平面方程 n·x + d = 0"""
+    c = pts.mean(axis=0)
+    # 最小奇异向量即为平面法向量
+    _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+    n = vt[-1]
+    n = n / np.linalg.norm(n)
+    return n, -float(n @ c)
+
+
+def _fit_plane_ransac(pts, thresh, iters=800):
+    """纯 numpy 的 3D 平面 RANSAC
+
+    每次随机取 3 点 → 叉乘求过这 3 点的平面 → 统计到该平面距离 < thresh 的点数，
+    保留 inlier 最多的那个平面，最后用全部 inlier 做 PCA 精修。
+    返回 (单位法向量 n, 截距 d, inlier 布尔掩码)；失败时返回 (None, None, None)。
+    """
+    n_pts = len(pts)
+    if n_pts < 3:
+        return None, None, None
+
+    best_cnt, best_n, best_d, best_mask = 0, None, None, None
+    for _ in range(iters):
+        p0, p1, p2 = pts[np.random.choice(n_pts, 3, replace=False)]
+        n = np.cross(p1 - p0, p2 - p0)
+        norm = np.linalg.norm(n)
+        if norm < 1e-9:          # 三点共线，无法确定平面
+            continue
+        n = n / norm
+        d = -float(n @ p0)
+        mask = np.abs(pts @ n + d) < thresh
+        cnt = int(mask.sum())
+        if cnt > best_cnt:
+            best_cnt, best_n, best_d, best_mask = cnt, n, d, mask
+
+    if best_mask is None or best_cnt < 3:
+        return None, None, None
+
+    # 用 inlier 全集精修（RANSAC 的 3 点解噪声大，PCA 拟合更准）
+    n, d = _refine_plane(pts[best_mask])
+    mask = np.abs(pts @ n + d) < thresh
+    return n, d, mask
+
+
+def _plane_grid_mesh(n, d, pts_in, grid=20):
+    """在真 3D 平面 (n·x+d=0) 上生成矩形网格面片
+
+    真 3D 平面无法用 z=f(x,y) 表达（墙/天花板会造成 x,y 一对多），
+    因此必须先在平面内构造正交基 (u, v)，再把 inlier 投影到该基底求展布。
+    """
+    c = pts_in.mean(axis=0)                      # 平面中心
+    # 构造平面内正交基：取与法向量最不平行的坐标轴做参考
+    ref = np.zeros(3)
+    ref[int(np.argmin(np.abs(n)))] = 1.0
+    u = np.cross(n, ref); u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+
+    rel = pts_in - c
+    su, sv = rel @ u, rel @ v
+    u0, u1 = float(su.min()), float(su.max())
+    v0, v1 = float(sv.min()), float(sv.max())
+    # 外扩 10% 边距
+    mu, mv = 0.1 * (u1 - u0), 0.1 * (v1 - v0)
+    u0, u1, v0, v1 = u0 - mu, u1 + mu, v0 - mv, v1 + mv
+
+    us = np.linspace(u0, u1, grid)
+    vs = np.linspace(v0, v1, grid)
+    U, V = np.meshgrid(us, vs)
+    verts = (c[None, :] + U.ravel()[:, None] * u[None, :]
+             + V.ravel()[:, None] * v[None, :])
+
+    faces = []
+    for i in range(grid - 1):
+        for j in range(grid - 1):
+            a = i * grid + j
+            faces.append([a, a + 1, a + grid])
+            faces.append([a + 1, a + grid + 1, a + grid])
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces))
+    extent = max(u1 - u0, v1 - v0)
+    return mesh, extent, c
+
+
+def _detect_ground_plane(pts, thresh):
+    """顺序 RANSAC 剥离候选平面，再按「水平性 / 低位性 / 支撑性」选出地面
+
+    ① 水平性  |n·up| > cos(20°)      → 排除墙
+    ② 低位性  平面高度 < 点云质心高度   → 排除天花板
+    ③ 支撑性  平面上方点数 >> 下方点数   → 排除天花板/悬空面
+    最后在通过者中取「位置最低」的 → 地面是支撑一切的最低水平面，桌面必在其上方
+
+    返回 (选中的平面 dict 或 None, 全部候选列表)
+    """
+    up = np.zeros(3); up[_UP_AXIS] = 1.0
+    all_h = pts[:, _UP_AXIS]                     # 全量高度，用于低位性/支撑性统计
+    # 用 1%/99% 分位数而非极值，避免离群点把高度区间撑坏
+    h_lo = float(np.percentile(all_h, 1))
+    h_hi = float(np.percentile(all_h, 99))
+    span = max(h_hi - h_lo, 1e-6)
+
+    work, cands = pts, []
+    for _ in range(5):                            # 最多剥离 5 个平面
+        if len(work) < 500:
+            break
+        n, d, mask = _fit_plane_ransac(work, thresh)
+        if n is None or int(mask.sum()) < 500:
+            break
+
+        plane_pts = work[mask]
+        if n @ up < 0:                            # 统一法向量朝上，便于比较高低
+            n, d = -n, -d
+        height   = float(plane_pts[:, _UP_AXIS].mean())
+        cos_tilt = float(abs(n @ up))             # 1.0 = 完全水平
+        # 支撑性在全量点云上统计（而非逐轮缩小的 work，否则语义随剥离进度漂移）
+        above = int((all_h > height + thresh).sum())
+        below = int((all_h < height - thresh).sum())
+
+        # ① 水平性：过滤掉墙
+        ok_tilt = cos_tilt > _HORIZ_COS
+        # ② 低位性：地面不能是点云里最高的那一层
+        #    用 h_hi 作上界而非"低于质心/中位数"——当地面就是全部点云时，
+        #    地面高度恰等于中位数，任何以中位数为界的判据都会恒假而误杀
+        ok_low = height < h_hi - 0.1 * span
+        # ③ 支撑性：平面上方点数不少于下方 —— 地面支撑万物，天花板反之
+        #    用 >= 而非倍数，保证"场景只有单一水平面"时不被误杀
+        ok_supp = above >= below
+        cands.append(dict(n=n, d=d, pts=plane_pts, cnt=int(mask.sum()),
+                          height=height, cos_tilt=cos_tilt,
+                          above=above, below=below,
+                          ok=ok_tilt and ok_low and ok_supp))
+
+        work = work[~mask]                        # 剥离该平面继续找下一个
+
+    valid = [c for c in cands if c["ok"]]
+    if not valid:
+        return None, cands
+    valid.sort(key=lambda c: (c["height"], -c["cnt"]))   # 最低者胜，同高取点多者
+    return valid[0], cands
+
+
+def _add_ground_plane(ply_path):
+    """对点云做 RANSAC 地面检测，生成地面面片+坐标轴，合并到 GLB"""
+    # 1. 加载点云
+    scene = trimesh.load(ply_path)
+    # 点云可能是 PointCloud 或 Trimesh，统一获取顶点
+    def _safe_colors(arr, n_pts):
+        """取顶点颜色；形状不对（无颜色/维度不符）时返回 None，避免 IndexError"""
+        if arr is None:
+            return None
+        c = np.asarray(arr)
+        return c[:, :3] if (c.ndim == 2 and len(c) == n_pts) else None
+
+    if isinstance(scene, trimesh.Trimesh):
+        pts = np.asarray(scene.vertices)
+        colors = _safe_colors(getattr(scene.visual, 'vertex_colors', None), len(pts))
+    elif isinstance(scene, trimesh.PointCloud):
+        pts = np.asarray(scene.vertices)
+        colors = _safe_colors(getattr(scene, 'colors', None), len(pts))
+    else:
+        return
+
+    # 采样点云用于显示（最多 200k 点）
+    if len(pts) > 200000:
+        idx_show = np.random.choice(len(pts), 200000, replace=False)
+        pc_pts = pts[idx_show]
+        pc_col = colors[idx_show] if colors is not None and len(colors) == len(pts) else None
+    else:
+        pc_pts = pts
+        pc_col = colors
+
+    # 点云用 trimesh.PointCloud 保留
+    pc_mesh = trimesh.PointCloud(vertices=pc_pts)
+    if pc_col is not None and len(pc_col) == len(pc_pts):
+        pc_mesh.colors = pc_col
+
+    # 2. 地面检测（纯 numpy 3D RANSAC + 三条件约束）
+    n_fit = min(50000, len(pts))
+    sample = pts[np.random.choice(len(pts), n_fit, replace=False)]
+
+    # 距离阈值随场景尺度自适应（DA3 输出尺度是 sim3 对齐后的任意尺度）
+    diag = float(np.linalg.norm(np.ptp(pts, axis=0)))
+    thresh = float(np.clip(0.008 * diag, 0.01, 0.2))
+
+    ground, cands = _detect_ground_plane(sample, thresh)
+
+    if _GROUND_DEBUG:
+        axis_names = "XYZ"
+        print(f"[地面检测] 上轴={axis_names[_UP_AXIS]}  阈值={thresh:.4f}  "
+              f"点数={len(sample)}")
+        for a in range(3):
+            print(f"            {axis_names[a]} 范围: "
+                  f"{pts[:, a].min():.3f} ~ {pts[:, a].max():.3f}  "
+                  f"(质心 {pts[:, a].mean():.3f})")
+        for i, c in enumerate(cands):
+            mark = "[通过]" if c["ok"] else "[淘汰]"   # 避免 GBK 控制台编码报错
+            print(f"            平面{i}: 点数={c['cnt']:>6} 高度={c['height']:.3f} "
+                  f"水平度={c['cos_tilt']:.3f} 上方={c['above']} 下方={c['below']} {mark}")
+        if ground:
+            print(f"            -> 选中: 点数={ground['cnt']} 高度={ground['height']:.3f}")
+        else:
+            print("            -> 未找到符合约束的地面平面，退化为场景中心坐标轴")
+            print(f"               提示: 若确认场景里有地面，可能上轴判断有误，"
+                  f"可把 _UP_AXIS 改成 {( _UP_AXIS + 1) % 3} 或 {( _UP_AXIS + 2) % 3} 再试")
+
+    # 3. 地面网格 / 坐标轴
+    plane_mesh = None
+    if ground is not None:
+        plane_mesh, extent, center = _plane_grid_mesh(
+            ground["n"], ground["d"], ground["pts"])
+        plane_mesh.visual.vertex_colors = [80, 200, 80, 50]
+        axis_len = extent * 0.2
+    else:
+        # 兜底：场景中心放一组坐标轴，不画地面
+        center = pts.mean(axis=0)
+        axis_len = float(np.ptp(pts, axis=0).max()) * 0.3
+
+    # 4. 坐标轴（世界轴对齐，原点落在地面中心）
+    origin = np.asarray(center)
+    colors_axis = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    axes_meshes = []
+    directions = [[axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]]
+    for i, (d_vec, col) in enumerate(zip(directions, colors_axis)):
+        seg = trimesh.creation.cylinder(radius=axis_len * 0.02, height=axis_len, sections=8)
+        if i == 0:
+            seg.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [0, 1, 0]))
+        elif i == 1:
+            seg.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+        seg.apply_translation(origin + np.array(d_vec) * 0.5)
+        seg.visual.vertex_colors = col
+        axes_meshes.append(seg)
+
+    # 5. 用 trimesh.Scene 包装所有几何体，导出 GLB
+    glb_path = os.path.splitext(ply_path)[0] + ".glb"
+    export_scene = trimesh.Scene()
+    export_scene.add_geometry(pc_mesh, node_name="pointcloud")
+    if plane_mesh is not None:
+        export_scene.add_geometry(plane_mesh, node_name="ground")
+    for i, ax in enumerate(axes_meshes):
+        export_scene.add_geometry(ax, node_name=f"axis_{i}")
+    export_scene.export(glb_path)
+
+
+# ============================================================
+# 后台工作线程（线程池 QRunnable）
 # ============================================================
 # Open3D 查看器线程（RANSAC 地面检测 + 坐标轴）
 # ============================================================
@@ -262,9 +536,17 @@ class DA3Runnable(QRunnable):
             sys.stdout = io.StringIO()
 
             self._log("DA3 推理中...", 30)
-            da3.run()               # 执行DA3推理（主要耗时操作）
-            da3.close()             # 关闭DA3实例，释放资源
-            sys.stdout = old_stdout # 恢复标准输出
+            try:
+                da3.run()
+            finally:
+                da3.close()
+                sys.stdout = old_stdout
+                # 手动清理临时目录（防止 da3.close 未覆盖的情况）
+                import shutil as _shutil
+                for _d in ["_tmp_results_unaligned", "_tmp_results_aligned", "_tmp_results_loop"]:
+                    _p = os.path.join(self.output_dir, _d)
+                    if os.path.exists(_p):
+                        _shutil.rmtree(_p, ignore_errors=True)
 
             self._log("融合点云并导出 GLB...", 80)
 
@@ -726,51 +1008,146 @@ class GradioLikeApp(QMainWindow):
         self._embedded_hwnd = None
         return t
 
-    def _open_in_open3d(self, ply_path):
-        self.pointcloud_label.setText("Loading Open3D...\n\n" + os.path.basename(ply_path))
-        # 先关闭旧的嵌入窗口
-        self._close_embedded_o3d()
-        self._o3d_viewer = Open3DViewer(ply_path)
-        self._o3d_viewer.hwnd_ready.connect(self._embed_o3d_window)
-        self._o3d_viewer.start()
+    def _start_http_server(self, serve_dir, cam=False):
+        """启动本地 HTTP 服务器（主流程与摄像头各用一个，互不干扰）
+        cam=False: 主流程服务器（端口 8765-8790）
+        cam=True : 摄像头服务器（端口 8791-8816）
+        """
+        srv_attr  = "_cam_http_server" if cam else "_http_server"
+        port_attr = "_cam_http_port"   if cam else "_http_port"
+        ports     = range(8791, 8816)  if cam else range(8765, 8790)
 
-    def _embed_o3d_window(self, hwnd):
-        """将 Open3D 窗口嵌入到 pointcloud_container"""
-        import ctypes
-        user32 = ctypes.windll.user32
-        container_id = int(self.pointcloud_container.winId())
-        user32.SetParent(hwnd, container_id)
-        # 去掉标题栏和边框
-        GWL_STYLE = -16
-        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-        style &= ~(0x00C00000 | 0x00080000 | 0x00040000)  # WS_CAPTION | WS_BORDER | WS_SIZEBOX
-        user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-        self._embedded_hwnd = hwnd
-        self.pointcloud_label.hide()
-        self._resize_embedded_o3d()
+        # 关闭同类型的旧服务（只关自己那套，不影响另一套）
+        old = getattr(self, srv_attr, None)
+        if old:
+            old.shutdown()
+            setattr(self, srv_attr, None)
+            setattr(self, port_attr, None)
 
-    def _resize_embedded_o3d(self):
-        """调整嵌入窗口大小"""
-        if self._embedded_hwnd:
-            import ctypes
-            rect = self.pointcloud_container.rect()
-            ctypes.windll.user32.SetWindowPos(
-                self._embedded_hwnd, 0, 0, 0, rect.width(), rect.height(), 0x0040)
-
-    def _close_embedded_o3d(self):
-        """关闭嵌入的 Open3D 窗口"""
-        if self._embedded_hwnd:
-            import ctypes
+        # 找空闲端口
+        port = None
+        for p in ports:
             try:
-                ctypes.windll.user32.DestroyWindow(self._embedded_hwnd)
-            except Exception:
-                pass
-            self._embedded_hwnd = None
-            self.pointcloud_label.show()
+                s = socket.socket()
+                s.bind(('', p))
+                s.close()
+                port = p
+                break
+            except OSError:
+                continue
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._resize_embedded_o3d()
+        if not port:
+            return None
+        setattr(self, port_attr, port)
+
+        class CORSHandler(SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=serve_dir, **kwargs)
+            def end_headers(self):
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "*")
+                super().end_headers()
+
+        server = HTTPServer(('127.0.0.1', port), CORSHandler)
+        setattr(self, srv_attr, server)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        return port
+
+    def _load_glb_in_viewer(self, glb_path, viewer=None, cam=False):
+        """在 Babylon.js 查看器中加载点云（可指定 viewer，默认 pointcloud_viewer）
+        cam=True 时使用摄像头专属 HTTP 服务器，避免与主流程互相覆盖"""
+        glb_dir = os.path.dirname(os.path.abspath(glb_path))
+        glb_name = os.path.basename(glb_path)
+        viewer = viewer or self.pointcloud_viewer
+
+        port = self._start_http_server(glb_dir, cam=cam)
+        if not port:
+            viewer.setHtml("<h3 style='color:red;text-align:center;margin-top:100px'>"
+                           "无法启动 HTTP 服务器</h3>")
+            return
+
+        glb_url = f"http://127.0.0.1:{port}/{glb_name}"
+
+        viewer.setHtml(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>3D Viewer</title>
+    <style>
+        /* 全局样式：无内外边距，隐藏溢出，全屏高度，深色背景 */
+        html, body {{ margin:0; padding:0; overflow:hidden; height:100%; background:#222; }}
+        #canvas {{ width:100%; height:100%; outline:none; }}
+        #loading {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+              color:#ccc; font-family:sans-serif; font-size:14px; }}
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="loading">Loading...</div>
+    <!-- ========== 加载 Babylon.js 库 ========== -->
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <script>
+        const canvas = document.getElementById("canvas");
+        const engine = new BABYLON.Engine(canvas, true, {{ preserveDrawingBuffer: true, stencil: true, antialias: true }});
+        const scene = new BABYLON.Scene(engine);
+        scene.clearColor = new BABYLON.Color4(0.15, 0.15, 0.18, 1);
+
+        // === 灯光 (Sandbox 同款) ===
+        const light = new BABYLON.HemisphericLight("light",
+            new BABYLON.Vector3(0, 1, 0), scene);
+        light.intensity = 0.7;
+
+        // === 相机（正视图角度，距离适中） ===
+        const camera = new BABYLON.ArcRotateCamera(
+            "cam",
+            Math.PI/2,          // alpha: 水平旋转角度90度
+            Math.PI/2.2,        // beta:  垂直旋转角度82度
+            5,                  // 初始半径（加载后自动适配）
+            BABYLON.Vector3.Zero(), scene);
+        camera.attachControl(canvas, true);
+        camera.lowerRadiusLimit = 0.0001;
+        camera.upperRadiusLimit = 10000;
+        camera.minZ = 0.0001;
+        camera.wheelPrecision = 50;       // 滚轮缩放（越大缩放越慢（更精确））
+        camera.angularSensibilityX = 1000;
+        camera.angularSensibilityY = 1000;
+        camera.panningSensibility = 1000;
+
+        BABYLON.SceneLoader.ImportMesh(
+            "",
+            "",
+            "{glb_url}",
+            scene,
+
+            function(meshes) {{
+                document.getElementById("loading").style.display = "none";
+                if (meshes.length > 0) {{
+                    const bb = meshes[0].getBoundingInfo().boundingBox;
+                    const center = bb.center;
+                    const size = bb.extendSize.length();
+                    camera.target = center;
+                    camera.radius = Math.max(size * 0.5, 0.1);
+                    camera.lowerRadiusLimit = size * 0.00001;
+                }}
+            }},
+            function(evt) {{
+                if (evt.lengthComputable) {{
+                    document.getElementById("loading").textContent =
+                        "Loading " + Math.round(evt.loaded*100/evt.total) + "%";
+                }}
+            }},
+            function() {{ document.getElementById("loading").textContent = "Load Failed"; }}
+        );
+
+        engine.runRenderLoop(() => scene.render());
+        window.addEventListener("resize", () => engine.resize());
+    </script>
+</body>
+</html>""")
 
     def _tab_depth(self):
         t = QWidget()
@@ -885,28 +1262,45 @@ class GradioLikeApp(QMainWindow):
         t = QWidget()
         l = QVBoxLayout(t)
 
-        # 左右分栏：摄像头 | 深度图
+        # 左右分栏 1:2
         panels = QHBoxLayout()
+        panels.setStretch(0, 1)
+        panels.setStretch(1, 3)
 
-        # 左：摄像头
-        left = QVBoxLayout()
+        # 左边：上下两栏（摄像头 | 深度图）
+        left_panel = QVBoxLayout()
         self.cam_label = QLabel("摄像头未开启")
         self.cam_label.setAlignment(Qt.AlignCenter)
-        self.cam_label.setMinimumHeight(350)
+        self.cam_label.setMinimumHeight(180)
+        self.cam_label.setScaledContents(True)
         self.cam_label.setStyleSheet(
-            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
-        left.addWidget(self.cam_label)
-        panels.addLayout(left)
+            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 12px;")
+        left_panel.addWidget(self.cam_label)
 
-        # 右：深度图
-        right = QVBoxLayout()
         self.cam_depth_label = QLabel("深度图")
         self.cam_depth_label.setAlignment(Qt.AlignCenter)
-        self.cam_depth_label.setMinimumHeight(350)
+        self.cam_depth_label.setMinimumHeight(180)
+        self.cam_depth_label.setScaledContents(True)
         self.cam_depth_label.setStyleSheet(
-            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
-        right.addWidget(self.cam_depth_label)
-        panels.addLayout(right)
+            "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 12px;")
+        left_panel.addWidget(self.cam_depth_label)
+
+        panels.addLayout(left_panel)
+
+        # 右边：3D 点云实时显示（Babylon.js）
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        self.cam_3d_view = QWebEngineView()
+        self.cam_3d_view.setMinimumHeight(380)
+        self.cam_3d_view.setHtml("""
+            <html><body style="background:#1a1a2e;display:flex;align-items:center;
+            justify-content:center;height:100vh;margin:0;font-family:sans-serif">
+            <div style="text-align:center;color:#e0e0e0">
+            <div style="font-size:36px;margin-bottom:12px">&#127758;</div>
+            <div style="font-size:14px">3D 点云（实时）</div>
+            <div style="font-size:11px;color:#888;margin-top:6px">开启摄像头后自动更新</div>
+            </div></body></html>
+        """)
+        panels.addWidget(self.cam_3d_view)
 
         l.addLayout(panels)
 
@@ -918,6 +1312,13 @@ class GradioLikeApp(QMainWindow):
             "QPushButton:hover { background-color: #1976D2; }")
         self.cam_toggle_btn.clicked.connect(self._on_toggle_camera)
         ctrl.addWidget(self.cam_toggle_btn)
+
+        self.cam_save_btn = QPushButton("💾 截图保存")
+        self.cam_save_btn.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; padding: 6px 14px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #45a049; }")
+        self.cam_save_btn.clicked.connect(self._on_cam_save)
+        ctrl.addWidget(self.cam_save_btn)
         ctrl.addStretch()
         l.addLayout(ctrl)
 
@@ -925,6 +1326,11 @@ class GradioLikeApp(QMainWindow):
         self._cam_depth_running = False
         self._cam_timer = QTimer()
         self._cam_timer.timeout.connect(self._on_cam_frame)
+        self._cam_last_frame = None  # 最新帧
+        self._cam_last_depth = None  # 最新深度图
+        self._cam_http_server = None  # 摄像头专属 HTTP 服务器（与主流程独立）
+        self._cam_http_port = None
+        self._cam_prev_tmp_dir = None  # 上一帧临时目录（新帧就绪后清理）
         return t
 
     def _on_toggle_camera(self):
@@ -937,10 +1343,22 @@ class GradioLikeApp(QMainWindow):
                 self._cam_persistent_worker.stop()
                 self._cam_persistent_worker.wait()
                 self._cam_persistent_worker = None
+            # 关闭摄像头专属 HTTP 服务器
+            if hasattr(self, '_cam_http_server') and self._cam_http_server:
+                self._cam_http_server.shutdown()
+                self._cam_http_server = None
+                self._cam_http_port = None
             self.cam_label.setPixmap(QPixmap())
             self.cam_label.setText("摄像头未开启")
             self.cam_label.setStyleSheet(
                 "background-color: #1a1a2e; color: #888; border-radius: 8px; font-size: 14px;")
+            self.cam_3d_view.setHtml("""
+                <html><body style="background:#1a1a2e;display:flex;align-items:center;
+                justify-content:center;height:100vh;margin:0;font-family:sans-serif">
+                <div style="text-align:center;color:#e0e0e0">
+                <div style="font-size:36px;margin-bottom:12px">&#127758;</div>
+                <div style="font-size:14px">3D 点云（实时）</div></div></body></html>
+            """)
             self.cam_toggle_btn.setText("📷 开启摄像头")
         else:
             import cv2
@@ -966,29 +1384,94 @@ class GradioLikeApp(QMainWindow):
         ret, frame = self._cam_cap.read()
         if not ret:
             return
-        # 显示 RGB 画面
+        self._cam_last_frame = frame.copy()  # 保存最新帧
+
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
         h, w, _ = rgb.shape
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.cam_label.width(), self.cam_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.cam_label.setPixmap(pix)
+        self.cam_label.setPixmap(QPixmap.fromImage(qimg))
 
-        # 提交帧给持久线程（自动丢弃旧帧，避免积压）
         if hasattr(self, '_cam_persistent_worker') and self._cam_persistent_worker:
             self._cam_persistent_worker.submit_frame(frame)
 
-    def _on_cam_depth_finished(self, depth):
+    def _on_cam_save(self):
+        """保存当前帧：frame.png + depth.png + combined.glb"""
+        if self._cam_last_frame is None:
+            self.status_label.setText("⚠️ 无帧可保存")
+            return
+        save_dir = os.path.join("output", "cam_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(save_dir, exist_ok=True)
+
+        import cv2
+        # 1. RGB 帧
+        cv2.imwrite(os.path.join(save_dir, "frame.png"), self._cam_last_frame)
+
+        # 2. 彩色深度图
+        if hasattr(self, '_cam_last_depth') and self._cam_last_depth is not None:
+            from depth_anything_3.utils.visualize import visualize_depth
+            depth_color = visualize_depth(self._cam_last_depth)
+            cv2.imwrite(os.path.join(save_dir, "depth.png"),
+                        depth_color[:, :, ::-1])
+
+        # 3. 从 DA3 输出目录拷贝 combined.glb（与主流程一致）
+        if hasattr(self, '_cam_last_output_dir'):
+            src_glb = os.path.join(self._cam_last_output_dir, "combined.glb")
+            if os.path.exists(src_glb):
+                shutil.copy2(src_glb, os.path.join(save_dir, "combined.glb"))
+
+        self.status_label.setText(f"💾 已保存: {save_dir}")
+
+    def _on_cam_depth_finished(self, output_dir):
+        """接收 DA3_Streaming 输出目录，读取深度图并显示 3D 点云"""
+        self._cam_last_output_dir = output_dir  # 保存输出目录，供截图使用
+        npz_dir = os.path.join(output_dir, "results_output")
+        npz_files = sorted(glob.glob(os.path.join(npz_dir, "frame_*.npz")))
+        if not npz_files:
+            return
+        data = np.load(npz_files[0])
+        depth = data["depth"]
+        self._cam_last_depth = depth
+
         from depth_anything_3.utils.visualize import visualize_depth
         d_vis = visualize_depth(depth)
         h, w, _ = d_vis.shape
         qimg = QImage(d_vis.data, w, h, w * 3, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.cam_depth_label.width(), self.cam_depth_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.cam_depth_label.setPixmap(pix)
+        self.cam_depth_label.setPixmap(QPixmap.fromImage(qimg))
         self.cam_depth_label.setText("")
+
+        try:
+            self._update_cam_3d(output_dir)
+        except Exception:
+            pass
+
+    def _update_cam_3d(self, output_dir):
+        """DA3 输出目录 → npz → GLB → 3D 显示"""
+        import importlib.util
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _spec = importlib.util.spec_from_file_location(
+            "npz_proc", os.path.join(_here, "npz_output_process.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+
+        res_dir = os.path.join(output_dir, "results_output")
+        poses_file = os.path.join(output_dir, "camera_poses.txt")
+        glb_path = os.path.join(output_dir, "combined.glb")
+
+        if os.path.exists(res_dir) and os.path.exists(poses_file):
+            _mod.create_point_cloud(
+                npz_folder=res_dir, pose_file=poses_file,
+                output_ply=os.path.join(output_dir, "combined.ply"),
+                conf_threshold_coef=0.5, sample_ratio=1.0)
+
+        if os.path.exists(glb_path):
+            self._load_glb_in_viewer(glb_path, viewer=self.cam_3d_view, cam=True)
+
+            # 新帧显示就绪后，清理上一帧的临时目录
+            # （此时摄像头服务器已切换到新目录，旧目录不再被引用）
+            prev_tmp = getattr(self, "_cam_prev_tmp_dir", None)
+            if prev_tmp and os.path.isdir(prev_tmp):
+                shutil.rmtree(prev_tmp, ignore_errors=True)
+            self._cam_prev_tmp_dir = os.path.dirname(output_dir)
 
     def _on_cam_depth_error(self, err):
         self._cam_depth_running = False
@@ -1166,6 +1649,16 @@ class GradioLikeApp(QMainWindow):
         # 等待线程池中的任务完成（已提交的不可取消）
         QThreadPool.globalInstance().clear()
         QThreadPool.globalInstance().waitForDone()
+
+        # 关闭 HTTP 服务器（主流程 + 摄像头两套）
+        if self._http_server:
+            self._http_server.shutdown()
+            self._http_server = None
+            self._http_port = None
+        if hasattr(self, '_cam_http_server') and self._cam_http_server:
+            self._cam_http_server.shutdown()
+            self._cam_http_server = None
+            self._cam_http_port = None
 
         # 重置上传进度
         self.upload_bar.setValue(0)
